@@ -4,7 +4,7 @@ branches:
     - master
 
 # Operating system (build VM template)
-os: Visual Studio 2015
+os: Visual Studio 2019
 
 # clone directory
 clone_folder: c:\projects\freeablo
@@ -12,8 +12,14 @@ clone_folder: c:\projects\freeablo
 platform: x64
 configuration: Debug
 
-cache:
-  - C:\.hunter
+environment:
+  global:
+    GITHUB_USER_PASSWORD:
+      secure: j7bhatwEDvl5hOfkBHyCIFZdn/x00TkF2qTaJMRn22CJeUr5NhXWPlUepQun7me9
+      
+install:
+  - cmd: set PATH=C:\Python34-x64;C:\Python34-x64\Scripts;%PATH%
+  - cmd: pip install requests
 
 # scripts to run before build
 before_build:
@@ -21,13 +27,12 @@ before_build:
   - cd c:\projects\freeablo
   - mkdir build
   - cd build
-  - mklink /j resources ..\resources
-  - cmake .. -G "Visual Studio 14 2015 Win64" -DFA_TREAT_WARNINGS_AS_ERRORS=ON
+  - cmake .. -G "Visual Studio 16 2019" -DFA_TREAT_WARNINGS_AS_ERRORS=ON
 
 build:
   parallel: true
-  project: c:\projects\freeablo\build\Freeablo.sln # path to Visual Studio solution or project
+  project: c:\projects\freeablo\build\Freeablo.sln
 
 test_script:
   - cd c:\projects\freeablo\build
-  - cmake.exe --build . --config Debug --target fatest
+  - Debug\unit_tests.exe

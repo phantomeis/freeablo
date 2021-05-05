@@ -1,23 +1,11 @@
-
 #pragma once
-
-#include <algorithm>
-#include <functional>
-#include <iomanip>
-#include <iostream>
-#include <map>
-#include <queue>
-#include <set>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
+#include <misc/simplevec2.h>
 
 namespace FAWorld
 {
     class GameLevelImpl;
-    std::vector<std::pair<int32_t, int32_t>>
-    pathFind(GameLevelImpl* level, std::pair<int32_t, int32_t> start, std::pair<int32_t, int32_t>& goal, bool& bArrivable, bool findAdjacent);
+    class Actor;
+
+    Misc::Points neighbors(GameLevelImpl* level, const Actor* actor, const Misc::Point& location);
+    Misc::Points pathFind(GameLevelImpl* level, const Actor* actor, const Misc::Point& start, const Misc::Point& goal, bool& bArrivable, bool findAdjacent);
 }

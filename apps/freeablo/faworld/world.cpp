@@ -2,16 +2,13 @@
 #include "../engine/enginemain.h"
 #include "../engine/net/multiplayerinterface.h"
 #include "../engine/threadmanager.h"
-#include "../faaudio/audiomanager.h"
 #include "../fagui/dialogmanager.h"
 #include "../fagui/guimanager.h"
 #include "../falevelgen/levelgen.h"
-#include "../farender/renderer.h"
 #include "../fasavegame/gameloader.h"
 #include "actor.h"
 #include "actor/attackstate.h"
 #include "actor/basestate.h"
-#include "actorstats.h"
 #include "diabloexe/npc.h"
 #include "equiptarget.h"
 #include "findpath.h"
@@ -20,8 +17,6 @@
 #include "player.h"
 #include "playerbehaviour.h"
 #include "storedata.h"
-#include <algorithm>
-#include <boost/make_unique.hpp>
 #include <diabloexe/diabloexe.h>
 #include <iostream>
 #include <misc/assert.h>
@@ -33,13 +28,15 @@ namespace FAWorld
     World::World(const DiabloExe::DiabloExe& exe, uint32_t seed)
         : mDiabloExe(exe), mRng(new Random::RngMersenneTwister(seed)),
           mLevelRng(new Random::RngMersenneTwister(uint32_t(mRng->randomInRange(std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max())))),
-          mItemFactory(boost::make_unique<ItemFactory>(exe, *mRng.get())), mStoreData(boost::make_unique<StoreData>(*mItemFactory))
+          mItemFactory(std::make_unique<ItemFactory>(exe, *mRng.get())), mStoreData(std::make_unique<StoreData>(*mItemFactory))
     {
         this->setupObjectIdMappers();
-        regenerateStoreItems();
+
+        if (mDiabloExe.isLoaded())
+            generateStoreItems();
     }
 
-    void World::regenerateStoreItems() { mStoreData->regenerateGriswoldBasicItems(10 /*placeholder*/, *mRng.get()); }
+    void World::generateStoreItems() { mStoreData->generateGriswoldBasicItems(10 /*placeholder*/, *mRng.get()); }
 
     void World::load(FASaveGame::GameLoader& loader)
     {
@@ -50,6 +47,7 @@ namespace FAWorld
             new (this) World(tmp, 0U);
         }
 
+        mLoading = true;
         loader.currentlyLoadingWorld = this;
 
         mRng->load(loader);
@@ -71,14 +69,16 @@ namespace FAWorld
         }
 
         mNextId = loader.load<int32_t>();
+        mNextPlayerClass = PlayerClass(loader.load<uint8_t>());
         mStoreData->load(loader);
 
         loader.runFunctionsToRunAtEnd();
 
+        mLoading = false;
         loader.currentlyLoadingWorld = nullptr;
     }
 
-    void World::save(FASaveGame::GameSaver& saver)
+    void World::save(FASaveGame::GameSaver& saver) const
     {
         mRng->save(saver);
         mLevelRng->save(saver);
@@ -98,6 +98,7 @@ namespace FAWorld
         }
 
         saver.save(mNextId);
+        saver.save(uint8_t(mNextPlayerClass));
         mStoreData->save(saver);
     }
 
@@ -105,12 +106,16 @@ namespace FAWorld
     {
         mObjectIdMapper.addClass(Actor::typeId, [&](FASaveGame::GameLoader& loader) { return new Actor(*this, loader); });
         mObjectIdMapper.addClass(Player::typeId, [&](FASaveGame::GameLoader& loader) { return new Player(*this, loader); });
+        mObjectIdMapper.addClass(Monster::typeId, [&](FASaveGame::GameLoader& loader) { return new Monster(*this, loader); });
 
         mObjectIdMapper.addClass(NullBehaviour::typeId, [](FASaveGame::GameLoader&) { return new NullBehaviour(); });
         mObjectIdMapper.addClass(BasicMonsterBehaviour::typeId, [](FASaveGame::GameLoader& loader) { return new BasicMonsterBehaviour(loader); });
-        mObjectIdMapper.addClass(PlayerBehaviour::typeId, [](FASaveGame::GameLoader&) { return new PlayerBehaviour(); });
+        mObjectIdMapper.addClass(PlayerBehaviour::typeId, [](FASaveGame::GameLoader& loader) { return new PlayerBehaviour(loader); });
 
         mObjectIdMapper.addClass(ActorState::MeleeAttackState::typeId, [](FASaveGame::GameLoader& loader) { return new ActorState::MeleeAttackState(loader); });
+        mObjectIdMapper.addClass(ActorState::RangedAttackState::typeId,
+                                 [](FASaveGame::GameLoader& loader) { return new ActorState::RangedAttackState(loader); });
+        mObjectIdMapper.addClass(ActorState::SpellAttackState::typeId, [](FASaveGame::GameLoader& loader) { return new ActorState::SpellAttackState(loader); });
         mObjectIdMapper.addClass(ActorState::BaseState::typeId, [](FASaveGame::GameLoader&) { return new ActorState::BaseState(); });
     }
 
@@ -137,7 +142,7 @@ namespace FAWorld
             if (x >= static_cast<int32_t>(getCurrentLevel()->width()) || y >= static_cast<int32_t>(getCurrentLevel()->height()))
                 return nullptr;
 
-            auto actor = getActorAt(x, y);
+            auto actor = getActorAt(Misc::Point(x, y));
             if (actor && !actor->isDead() && actor != getCurrentPlayer())
                 return actor;
 
@@ -146,15 +151,15 @@ namespace FAWorld
         auto tile = getTileByScreenPos(screenPosition);
         // actors could be hovered/targeted by hexagonal pattern consisiting of two tiles on top of each other + halves of two adjacent tiles
         // the same logic seems to apply ot other tall objects
-        if (auto actor = actorStayingAt(tile.x, tile.y))
+        if (auto actor = actorStayingAt(tile.pos.x, tile.pos.y))
             return actor;
-        if (auto actor = actorStayingAt(tile.x + 1, tile.y + 1))
+        if (auto actor = actorStayingAt(tile.pos.x + 1, tile.pos.y + 1))
             return actor;
         if (tile.half == Render::TileHalf::right)
-            if (auto actor = actorStayingAt(tile.x + 1, tile.y))
+            if (auto actor = actorStayingAt(tile.pos.x + 1, tile.pos.y))
                 return actor;
         if (tile.half == Render::TileHalf::left)
-            if (auto actor = actorStayingAt(tile.x, tile.y + 1))
+            if (auto actor = actorStayingAt(tile.pos.x, tile.pos.y + 1))
                 return actor;
         return nullptr;
     }
@@ -180,24 +185,33 @@ namespace FAWorld
         Level::Dun sector3("levels/towndata/sector3s.dun");
         Level::Dun sector4("levels/towndata/sector4s.dun");
 
+        // Map from tileset frame number to special cel frame number.
+        // Special cel images are mostly used for arches / open doors.
+        // The town special cel images overlay on trees, although do
+        // not seem to make any difference to the final output.
+        // TODO: load specialCelMap from file.
+        std::map<int32_t, int32_t> specialCelMap = {
+            {357, 1}, {128, 5}, {129, 6}, {127, 7}, {116, 8}, {156, 9}, {157, 10}, {155, 11}, {161, 12}, {159, 13}, {213, 14}, {211, 15}, {216, 16}, {215, 17}};
+
         Level::Level townLevelBase(Level::Dun::getTown(sector1, sector2, sector3, sector4),
+                                   0,
                                    "levels/towndata/town.til",
                                    "levels/towndata/town.min",
                                    "levels/towndata/town.sol",
                                    "levels/towndata/town.cel",
-                                   std::make_pair(25u, 29u),
-                                   std::make_pair(75u, 68u),
-                                   std::map<int32_t, int32_t>(),
-                                   static_cast<int32_t>(-1),
-                                   1);
+                                   "levels/towndata/towns.cel",
+                                   specialCelMap,
+                                   Level::LevelTransitionArea{-1, {75, 68}, {0, 0}, {0, 0}, {0, 0}},
+                                   Level::LevelTransitionArea{1, {25, 29}, {1, 1}, {0, 1}, {0, 0}},
+                                   std::map<int32_t, int32_t>());
 
         auto townLevel = new GameLevel(*this, std::move(townLevelBase), 0);
         mLevels[0] = townLevel;
 
         for (auto npc : mDiabloExe.getNpcs())
         {
-            Actor* actor = new Actor(*this, *npc, mDiabloExe);
-            actor->teleport(townLevel, Position(npc->x, npc->y, static_cast<Misc::Direction>(npc->rotation)));
+            auto actor = new Actor(*this, *npc, mDiabloExe);
+            actor->teleport(townLevel, Position(Misc::Point(npc->x, npc->y), Misc::Direction(static_cast<Misc::Direction8>(npc->rotation))));
         }
 
         for (int32_t i = 1; i < 17; i++)
@@ -210,14 +224,13 @@ namespace FAWorld
 
     int32_t World::getCurrentLevelIndex() { return mCurrentPlayer->getLevel()->getLevelIndex(); }
 
-    void World::setLevel(int32_t levelNum)
+    void World::setLevel(int32_t levelNum, bool upStairsPos)
     {
         if (levelNum >= int32_t(mLevels.size()) || levelNum < 0 || (mCurrentPlayer->getLevel() && mCurrentPlayer->getLevel()->getLevelIndex() == levelNum))
             return;
 
-        auto level = getLevel(levelNum);
-
-        mCurrentPlayer->teleport(level, FAWorld::Position(level->upStairsPos().first, level->upStairsPos().second));
+        GameLevel* level = getLevel(levelNum);
+        mCurrentPlayer->moveToLevel(level, upStairsPos);
     }
 
     void World::playLevelMusic(size_t level)
@@ -282,7 +295,7 @@ namespace FAWorld
 
     void World::insertLevel(size_t level, GameLevel* gameLevel) { mLevels[level] = gameLevel; }
 
-    Actor* World::getActorAt(size_t x, size_t y) { return getCurrentLevel()->getActorAt(x, y); }
+    Actor* World::getActorAt(const Misc::Point& point) { return getCurrentLevel()->getActorAt(point); }
 
     void World::update(bool noclip, const std::vector<PlayerInput>& inputs)
     {
@@ -294,10 +307,20 @@ namespace FAWorld
             {
                 case PlayerInput::Type::PlayerJoined:
                 {
-                    FAWorld::Player* newPlayer = Engine::EngineMain::get()->mPlayerFactory->create(*this, "Warrior");
+                    if (Engine::EngineMain::get()->mMultiplayer->isPlayerRegistered(input.mData.dataPlayerJoined.peerId))
+                        break;
+
+                    PlayerClass playerClass = mNextPlayerClass;
+
+                    // hacky method to make different players use different classes
+                    // TODO: remove this when we have a proper character system
+                    mNextPlayerClass = PlayerClass((int32_t(mNextPlayerClass) + 1) % 3);
+
+                    FAWorld::Player* newPlayer = Engine::EngineMain::get()->mPlayerFactory->create(*this, playerClass);
                     registerPlayer(newPlayer);
                     FAWorld::GameLevel* level = getLevel(0);
-                    newPlayer->teleport(level, FAWorld::Position(level->upStairsPos().first, level->upStairsPos().second));
+
+                    newPlayer->moveToLevel(level, true);
                     Engine::EngineMain::get()->mMultiplayer->registerNewPlayer(newPlayer, input.mData.dataPlayerJoined.peerId);
 
                     break;
@@ -305,12 +328,15 @@ namespace FAWorld
                 case PlayerInput::Type::PlayerLeft:
                 {
                     // a little unsubtle, but it'll do for now.
-                    getActorById(input.mActorId)->die();
+                    if (Actor* actor = getActorById(input.mActorId))
+                        actor->die();
                     break;
                 }
                 default:
                 {
-                    static_cast<Player*>(this->getActorById(input.mActorId))->getPlayerBehaviour()->addInput(input);
+                    if (Player* player = dynamic_cast<Player*>(this->getActorById(input.mActorId)))
+                        player->getPlayerBehaviour()->addInput(input);
+                    break;
                 }
             }
         }
@@ -336,17 +362,6 @@ namespace FAWorld
     {
         debug_assert(mCurrentPlayer == nullptr || mCurrentPlayer == player);
         mCurrentPlayer = player;
-        setupCurrentPlayer();
-    }
-
-    void World::setupCurrentPlayer()
-    {
-        /*mCurrentPlayer->positionReached.connect([this](const std::pair<int32_t, int32_t>& pos) {
-            if (!getCurrentLevel()->isTown() && pos == getCurrentLevel()->upStairsPos())
-                changeLevel(true);
-            else if (pos == getCurrentLevel()->downStairsPos())
-                changeLevel(false);
-        });*/
     }
 
     void World::registerPlayer(Player* player)
@@ -383,21 +398,12 @@ namespace FAWorld
         return NULL;
     }
 
-    void World::getAllActors(std::vector<Actor*>& actors)
-    {
-        for (auto pair : mLevels)
-        {
-            if (pair.second)
-                pair.second->getActors(actors);
-        }
-    }
-
     Tick World::getCurrentTick() { return mTicksPassed; }
 
     PlacedItemData* World::targetedItem(Misc::Point screenPosition)
     {
         auto tile = getTileByScreenPos(screenPosition);
-        return getCurrentLevel()->getItemMap().getItemAt({tile.x, tile.y});
+        return getCurrentLevel()->getItemMap().getItemAt(tile.pos);
     }
 
     Tick World::getTicksInPeriod(FixedPoint seconds) { return std::max(Tick(1), Tick((FixedPoint(ticksPerSecond) * seconds).round())); }

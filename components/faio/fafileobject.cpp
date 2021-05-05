@@ -1,7 +1,7 @@
 #include "fafileobject.h"
 #include <iostream>
 
-FAIO::FAFileObject::FAFileObject(const std::string pathFile) { faFile = FAIO::FAfopen(pathFile); }
+FAIO::FAFileObject::FAFileObject(const std::string& pathFile) { faFile = FAIO::FAfopen(pathFile); }
 
 FAIO::FAFileObject::~FAFileObject()
 {
@@ -56,6 +56,15 @@ size_t FAIO::FAFileObject::FAsize()
     return FAIO::FAsize(faFile);
 }
 
+std::vector<uint8_t> FAIO::FAFileObject::readAll()
+{
+    std::vector<uint8_t> retval;
+    size_t size = FAsize();
+    retval.resize(size);
+    FAfread(retval.data(), 1, size);
+    return retval;
+}
+
 uint32_t FAIO::FAFileObject::read32()
 {
     if (!faFile)
@@ -105,7 +114,5 @@ std::string FAIO::FAFileObject::readCStringFromWin32Binary(size_t ptr, size_t of
     }
     return FAIO::readCStringFromWin32Binary(faFile, ptr, offset);
 }
-
-std::string FAIO::FAFileObject::getMPQFileName() { return FAIO::getMPQFileName(); }
 
 void FAIO::FAFileObject::quit() { FAIO::quit(); }

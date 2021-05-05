@@ -1,20 +1,19 @@
 #include "diabloexe.h"
-
-#include <stdint.h>
-
-#include <iomanip>
-#include <iostream>
-#include <sstream>
-
-#include <misc/md5.h>
-#include <misc/stringops.h>
-
-#include "../../apps/freeablo/faworld/item.h"
 #include "baseitem.h"
 #include "characterstats.h"
 #include "monster.h"
 #include "npc.h"
 #include "settings/settings.h"
+#include "talkdata.h"
+#include <cstdint>
+#include <diabloexe/exemagicitemeffect.h>
+#include <diabloexe/uniqueitem.h>
+#include <iomanip>
+#include <iostream>
+#include <misc/md5.h>
+#include <misc/misc.h>
+#include <misc/stringops.h>
+#include <unordered_set>
 
 namespace DiabloExe
 {
@@ -39,14 +38,15 @@ namespace DiabloExe
 
     DiabloExe::DiabloExe(const std::string& pathEXE)
     {
+        if (pathEXE.empty())
+            return;
+
         mSettings.reset(new Settings::Settings());
         mVersion = getVersion(pathEXE);
         if (mVersion.empty())
-        {
             return;
-        }
 
-        if (!mSettings->loadFromFile("resources/exeversions/" + mVersion + ".ini"))
+        if (!mSettings->loadFromFile(mVersion.iniPath))
         {
             std::cout << "Cannot load settings file.";
             return;
@@ -54,9 +54,7 @@ namespace DiabloExe
 
         FAIO::FAFileObject exe(pathEXE);
         if (!exe.isValid())
-        {
             return;
-        }
 
         auto codeOffset = mSettings->get<size_t>("Common", "codeOffset");
         loadFontData(exe);
@@ -65,9 +63,13 @@ namespace DiabloExe
         loadNpcs(exe);
         loadCharacterStats(exe);
         loadDropGraphicsFilenames(exe, codeOffset);
+        loadSoundFilenames(exe, codeOffset);
         loadBaseItems(exe, codeOffset);
         loadUniqueItems(exe, codeOffset);
-        loadAffixes(exe, codeOffset);
+        loadMagicItemEffects(exe, codeOffset);
+        loadMissileGraphicsTable(exe, codeOffset);
+        loadMissileDataTable(exe);
+        loadSpellsTable(exe, codeOffset);
     }
 
     DiabloExe::~DiabloExe() {}
@@ -110,25 +112,23 @@ namespace DiabloExe
         return s.str();
     }
 
-    std::string DiabloExe::getVersion(const std::string& pathEXE)
+    DiabloExe::VersionResult DiabloExe::getVersion(const std::string& pathEXE)
     {
         std::string exeMD5 = getMD5(pathEXE);
         if (exeMD5.empty())
-        {
-            return std::string();
-        }
+            return {"", ""};
 
         Settings::Settings settings;
         std::string version = "";
-        settings.loadFromFile("resources/exeversions/versions.ini");
-        Settings::Container sections = settings.getSections();
+        settings.loadFromFile(Misc::getResourcesPath().str() + "/exeversions/versions.ini");
+        const Settings::Container versionProperties = settings.getPropertiesInSection("");
 
-        for (Settings::Container::iterator it = sections.begin(); it != sections.end(); ++it)
+        for (const auto& versionProperty : versionProperties)
         {
-            std::string temporaryVersion = settings.get<std::string>("", *it);
+            const std::string temporaryVersion = settings.get<std::string>("", versionProperty);
             if (temporaryVersion == exeMD5)
             {
-                version = *it;
+                version = versionProperty;
                 break;
             }
         }
@@ -136,25 +136,54 @@ namespace DiabloExe
         if (version == "")
         {
             std::cerr << "Unrecognised version of Diablo.exe" << std::endl;
-            return "";
+            return {"", ""};
         }
 
         else
             std::cout << "Diablo.exe " << version << " detected" << std::endl;
 
-        return version;
+        std::string iniPath = Misc::getResourcesPath().str() + "/exeversions/" + settings.get<std::string>("", "ini_" + version, version + ".ini");
+
+        return {version, iniPath};
     }
 
     void DiabloExe::loadDropGraphicsFilenames(FAIO::FAFileObject& exe, size_t codeOffset)
     {
-        auto offset = mSettings->get<size_t>("ItemDropGraphics", "filenames");
-        itemDropGraphicsFilename.resize(35);
-        for (int i = 0; i < static_cast<int>(itemDropGraphicsFilename.size()); ++i)
+        const uint64_t offset = mSettings->get<uint64_t>("ItemDropGraphics", "filenames");
+        mItemDropGraphicsFilename.resize(35);
+        for (int i = 0; i < static_cast<int>(mItemDropGraphicsFilename.size()); ++i)
         {
             exe.FAfseek(offset + i * 4, SEEK_SET);
             auto nameOffset = exe.read32();
-            itemDropGraphicsFilename[i] = exe.readCStringFromWin32Binary(nameOffset, codeOffset);
+            mItemDropGraphicsFilename[i] = exe.readCStringFromWin32Binary(nameOffset, codeOffset);
         }
+    }
+
+    void DiabloExe::loadSoundFilenames(FAIO::FAFileObject& exe, size_t codeOffset)
+    {
+        uint64_t offset = mSettings->get<uint64_t>("Sounds", "filenameTable");
+        int32_t filenameTableSize = mSettings->get<int32_t>("Sounds", "filenameTableSize");
+        mSoundFilename.resize(filenameTableSize);
+        for (int i = 0; i < static_cast<int>(mSoundFilename.size()); ++i)
+        {
+            exe.FAfseek(offset + i * 9 + 1, SEEK_SET);
+            auto nameOffset = exe.read32();
+            mSoundFilename[i] = exe.readCStringFromWin32Binary(nameOffset, codeOffset);
+            mSoundFilename[i] = Misc::StringUtils::toLower(mSoundFilename[i]);
+            Misc::StringUtils::replace(mSoundFilename[i], "\\", "/");
+        }
+
+        offset = mSettings->get<uint64_t>("Sounds", "itemGraphicsIdToDropSfxId");
+        mItemGraphicsIdToDropSfxId.resize(35);
+        exe.FAfseek(offset, SEEK_SET);
+        for (auto& sfxLookup : mItemGraphicsIdToDropSfxId)
+            sfxLookup = exe.read32();
+
+        offset = mSettings->get<uint64_t>("Sounds", "itemGraphicsIdToInvPlaceSfxId");
+        mItemGraphicsIdToInvPlaceSfxId.resize(35);
+        exe.FAfseek(offset, SEEK_SET);
+        for (auto& sfxLookup : mItemGraphicsIdToInvPlaceSfxId)
+            sfxLookup = exe.read32();
     }
 
     void DiabloExe::loadMonsters(FAIO::FAFileObject& exe, size_t codeOffset)
@@ -174,10 +203,12 @@ namespace DiabloExe
                 for (j = 1; mMonsters.find(tmp.monsterName + "_" + std::to_string(j)) != mMonsters.end(); j++)
                     ;
 
-                mMonsters[tmp.monsterName + "_" + std::to_string(j)] = tmp;
+                tmp.idName = tmp.monsterName + "_" + std::to_string(j);
+                mMonsters[tmp.idName] = std::move(tmp);
             }
             else
             {
+                tmp.idName = tmp.monsterName;
                 mMonsters[tmp.monsterName] = tmp;
             }
         }
@@ -231,15 +262,84 @@ namespace DiabloExe
                 for (auto property : mSettings->getPropertiesInSection(section))
                 {
                     std::string talkPrefix = "talk#";
+                    std::string gossipPrefix = "gossip#";
+                    std::string beforeDungeonPrefix = "beforeDungeon";
+                    std::string questPrefix = "quest#";
                     if (Misc::StringUtils::startsWith(property, talkPrefix))
                     {
                         auto addr = mSettings->get<size_t>(section, property);
-                        curNpc.talkData[property.substr(talkPrefix.length())] = exe.readCString(addr);
+                        curNpc.menuTalkData[property.substr(talkPrefix.length())] = exe.readCString(addr);
                     }
+
+                    else if (Misc::StringUtils::startsWith(property, gossipPrefix))
+                    {
+                        auto addr = mSettings->get<size_t>(section, property);
+                        TalkData gossipData = {exe.readCString(addr), ""};
+                        gossipData.text.pop_back();
+                        curNpc.gossipData[property.substr(gossipPrefix.length())] = gossipData;
+                    }
+
+                    else if (property == beforeDungeonPrefix)
+                    {
+                        auto addr = mSettings->get<size_t>(section, property);
+                        curNpc.beforeDungeonTalkData = {exe.readCString(addr), ""};
+                        curNpc.beforeDungeonTalkData.text.pop_back();
+                    }
+
+                    /*else if (Misc::StringUtils::startsWith(property, questPrefix))
+                    {
+                        std::string quest = property.substr(questPrefix.size());
+                        auto temp = Misc::StringUtils::split(quest, '#');
+                        std::string questName = temp[0];
+                        std::string questPhase = temp[1];
+                        auto addr = mSettings->get<size_t>(section, property);
+                        TalkData data = {exe.readCString(addr), ""};
+
+                        if (questPhase == "info")
+                            curNpc.questTalkData[questName].info = data;
+
+                        else if (questPhase == "activation")
+                            curNpc.questTalkData[questName].activation = data;
+
+                        else if (questPhase == "return")
+                            curNpc.questTalkData[questName].returned = {data};
+
+                        else if (questPhase == "completion")
+                            curNpc.questTalkData[questName].completion = data;
+
+                        else
+                            curNpc.questTalkData[questName].returned.push_back(data);
+                    }*/
                 }
             }
         }
     }
+
+    class SimpleIdGenerator
+    {
+    public:
+        std::string generateIdFromName(const std::string_view name)
+        {
+            std::string idBase(name);
+            Misc::StringUtils::toLower(idBase);
+            Misc::StringUtils::replace(idBase, " ", "_");
+            Misc::StringUtils::replace(idBase, "-", "_");
+            idBase.erase(std::remove(idBase.begin(), idBase.end(), '\''), idBase.end());
+
+            std::string idName = idBase;
+            for (int32_t j = 1; usedIds.count(idName); j++)
+            {
+                idName = idBase + "_" + std::to_string(j);
+                Misc::StringUtils::replace(idName, "__", "_");
+            }
+
+            usedIds.insert(idName);
+            return idName;
+        }
+
+    private:
+        std::unordered_set<std::string> usedIds;
+    };
 
     void DiabloExe::loadBaseItems(FAIO::FAFileObject& exe, size_t codeOffset)
     {
@@ -262,13 +362,24 @@ namespace DiabloExe
         for (auto& el : objCursFrameSizes)
             el[1] = exe.read32();
         constexpr auto invCellSize = 28;
+
+        SimpleIdGenerator idGenerator;
+
         for (size_t i = 0; i < count; i++)
         {
             exe.FAfseek(itemOffset + 76 * i, SEEK_SET);
-            BaseItem tmp(exe, codeOffset);
-            tmp.id = i;
-            tmp.dropItemGraphicsPath = "items/" + itemDropGraphicsFilename[itemGraphicsIdToDropGraphicsId[tmp.invGraphicsId]] + ".cel";
-            auto& s = objCursFrameSizes[tmp.invGraphicsId + 11];
+            ExeItem tmp(exe, codeOffset);
+
+            if (tmp.name.empty())
+                continue;
+
+            tmp.idName = idGenerator.generateIdFromName(tmp.name);
+
+            size_t dropGraphicsId = itemGraphicsIdToDropGraphicsId[tmp.invGraphicsId];
+            tmp.dropItemGraphicsPath = "items/" + mItemDropGraphicsFilename[dropGraphicsId] + ".cel";
+            tmp.dropItemSoundPath = mSoundFilename[mItemGraphicsIdToDropSfxId[dropGraphicsId]];
+            tmp.invPlaceItemSoundPath = mSoundFilename[mItemGraphicsIdToInvPlaceSfxId[dropGraphicsId]];
+            const std::array<int32_t, 2>& s = objCursFrameSizes[tmp.invGraphicsId + 11];
             if (i == 0)
             {
                 tmp.invSizeX = 1;
@@ -301,20 +412,24 @@ namespace DiabloExe
         }
     }
 
-    void DiabloExe::loadAffixes(FAIO::FAFileObject& exe, size_t codeOffset)
+    void DiabloExe::loadMagicItemEffects(FAIO::FAFileObject& exe, size_t codeOffset)
     {
-        size_t affixOffset = mSettings->get<size_t>("Affix", "affixOffset");
-        size_t count = mSettings->get<size_t>("Affix", "count");
+        size_t offset = mSettings->get<size_t>("MagicItemEffect", "magicItemEffectOffset");
+        size_t count = mSettings->get<size_t>("MagicItemEffect", "count");
+
+        SimpleIdGenerator idGenerator;
 
         for (size_t i = 0; i < count; i++)
         {
-            exe.FAfseek(affixOffset + 48 * i, SEEK_SET);
-            Affix tmp(exe, codeOffset);
+            exe.FAfseek(offset + 48 * i, SEEK_SET);
+            ExeMagicItemEffect tmp(exe, codeOffset);
             if (Misc::StringUtils::containsNonPrint(tmp.mName))
                 continue;
             if (tmp.mName.empty())
                 continue;
-            mAffixes.push_back(tmp);
+
+            tmp.mIdName = idGenerator.generateIdFromName((tmp.mIsPrefix ? "prefix_" : "suffix_") + tmp.mName);
+            mMagicItemEffects.push_back(tmp);
         }
     }
 
@@ -427,10 +542,108 @@ namespace DiabloExe
 
         mCharacters["Warrior"] = meleeCharacter;
         mCharacters["Rogue"] = rangerCharacter;
-        mCharacters["Sorcerer"] = mageCharacter;
+        mCharacters["Sorceror"] = mageCharacter;
     }
 
-    const Monster& DiabloExe::getMonster(const std::string& name) const { return mMonsters.find(name)->second; }
+    void DiabloExe::loadMissileGraphicsTable(FAIO::FAFileObject& exe, size_t codeOffset)
+    {
+        const uint64_t offset = mSettings->get<uint64_t>("Missiles", "missileGraphicsOffset");
+        const int len = mSettings->get<uint64_t>("Missiles", "missileGraphicsTableLen");
+        const int rowSize = mSettings->get<uint64_t>("Missiles", "missileGraphicsRowSize");
+        for (int i = 0; i < len; i++)
+        {
+            exe.FAfseek(offset + i * rowSize, SEEK_SET);
+            auto missileGrapicsId = exe.read8();
+            auto& missileGraphics = mMissileGraphicsTable[missileGrapicsId];
+            missileGraphics.mNumAnimationFiles = exe.read8();
+            exe.read16(); // Padding
+            auto filenameOffset = exe.read32();
+            missileGraphics.mFlags = exe.read32();
+            for (int j = 0; j < 16; j++)
+                exe.read32(); // NULL pointer
+            for (auto& animationDelay : missileGraphics.mAnimationDelays)
+                animationDelay = exe.read8();
+            auto filename = exe.readCStringFromWin32Binary(filenameOffset, codeOffset);
+            missileGraphics.mFilename = Misc::StringUtils::toLower(filename);
+        }
+    }
+
+    void DiabloExe::loadMissileDataTable(FAIO::FAFileObject& exe)
+    {
+        const uint64_t offset = mSettings->get<uint64_t>("Missiles", "missileDataOffset");
+        const int len = mSettings->get<uint64_t>("Missiles", "missileDataTableLen");
+        const int rowSize = mSettings->get<uint64_t>("Missiles", "missileDataRowSize");
+        for (int i = 0; i < len; i++)
+        {
+            exe.FAfseek(offset + i * rowSize, SEEK_SET);
+            auto missileId = exe.read8();
+            auto& missileData = mMissileDataTable[missileId];
+            exe.read8();  // Padding
+            exe.read16(); // Padding
+            exe.read32(); // Function pointer
+            exe.read32(); // Function pointer
+            missileData.mDraw = exe.read32();
+            missileData.mType = exe.read8();
+            missileData.mResist = exe.read8();
+            missileData.mMissileGraphicsId = exe.read8();
+            exe.read8(); // Padding
+            int32_t soundEffectId = exe.read32();
+            missileData.mSoundEffect = soundEffectId == -1 ? "" : mSoundFilename[soundEffectId];
+            int32_t impactSoundEffectId = exe.read32();
+            missileData.mImpactSoundEffect = impactSoundEffectId == -1 ? "" : mSoundFilename[impactSoundEffectId];
+        }
+    }
+
+    void DiabloExe::loadSpellsTable(FAIO::FAFileObject& exe, size_t codeOffset)
+    {
+        const uint64_t offset = mSettings->get<uint64_t>("Spells", "spellsOffset");
+        const int len = mSettings->get<uint64_t>("Spells", "spellsTableLen");
+        const int rowSize = mSettings->get<uint64_t>("Spells", "spellsRowSize");
+        for (int i = 0; i < len; i++)
+        {
+            exe.FAfseek(offset + i * rowSize, SEEK_SET);
+            auto spellId = exe.read8();
+            auto& spellData = mSpellsDataTable[spellId];
+            spellData.mManaCost = exe.read8();
+            int8_t type = exe.read8();
+            switch (type)
+            {
+                case 0:
+                    spellData.mType = SpellData::SpellType::fire;
+                    break;
+                case 1:
+                    spellData.mType = SpellData::SpellType::lightning;
+                    break;
+                case 2:
+                default:
+                    spellData.mType = SpellData::SpellType::magic;
+                    break;
+            }
+            exe.read8(); // Padding
+            auto nameOffset = exe.read32();
+            auto skillTextOffset = exe.read32();
+            spellData.mBookLvl = exe.read32();
+            spellData.mStaffLvl = exe.read32();
+            spellData.mTargeted = (bool)exe.read32();
+            spellData.mTownSpell = (bool)exe.read32();
+            spellData.mMinMagic = exe.read32();
+            int8_t soundEffectId = exe.read8();
+            spellData.mSoundEffect = mSoundFilename[soundEffectId];
+            for (auto& missile : spellData.mMissiles)
+                missile = exe.read8();
+            spellData.mManaAdj = exe.read8();
+            spellData.mMinMana = exe.read8();
+            exe.read16(); // Padding
+            spellData.mStaffMin = exe.read32();
+            spellData.mStaffMax = exe.read32();
+            spellData.mBookCost = exe.read32();
+            spellData.mStaffCost = exe.read32();
+            spellData.mNameText = exe.readCStringFromWin32Binary(nameOffset, codeOffset);
+            spellData.mSkillText = exe.readCStringFromWin32Binary(skillTextOffset, codeOffset);
+        }
+    }
+
+    const Monster& DiabloExe::getMonster(const std::string& name) const { return mMonsters.at(name); }
 
     const CharacterStats DiabloExe::getCharacterStat(std::string character) const { return mCharacters.at(character); }
 
@@ -470,37 +683,37 @@ namespace DiabloExe
         std::stringstream ss;
 
         ss << "Monsters: " << mMonsters.size() << std::endl;
-        for (std::map<std::string, Monster>::const_iterator it = mMonsters.begin(); it != mMonsters.end(); ++it)
+        for (const auto& mMonster : mMonsters)
         {
-            ss << it->second.dump();
+            ss << mMonster.second.dump();
         }
 
         ss << "Npcs: " << mNpcs.size() << std::endl;
-        for (std::map<std::string, Npc>::const_iterator it = mNpcs.begin(); it != mNpcs.end(); ++it)
+        for (const auto& mNpc : mNpcs)
         {
-            ss << it->first << std::endl << it->second.dump();
+            ss << mNpc.first << std::endl << mNpc.second.dump();
         }
 
         ss << "Character Stats: " << mCharacters.size() << std::endl
            << "Warrior" << std::endl
            << mCharacters.at("Warrior").dump() << "Rogue" << std::endl
-           << mCharacters.at("Rogue").dump() << "Sorcerer" << std::endl
-           << mCharacters.at("Sorcerer").dump();
+           << mCharacters.at("Rogue").dump() << "Sorceror" << std::endl
+           << mCharacters.at("Sorceror").dump();
 
         ss << "Base Items: " << mBaseItems.size() << std::endl;
-        for (auto& baseItem : mBaseItems)
+        for (const auto& baseItem : mBaseItems)
             ss << baseItem.dump();
 
         ss << "Unique Items: " << mUniqueItems.size() << std::endl;
-        for (auto& uniqueItem : mUniqueItems)
+        for (const auto& uniqueItem : mUniqueItems)
             ss << uniqueItem.dump();
 
-        ss << "Affixes: " << mAffixes.size() << std::endl;
-        for (auto& affix : mAffixes)
-            ss << affix.dump();
+        ss << "Magic Item Effects: " << mMagicItemEffects.size() << std::endl;
+        for (const auto& effect : mMagicItemEffects)
+            ss << effect.dump();
 
         return ss.str();
     }
 
-    bool DiabloExe::isLoaded() const { return !mMonsters.empty() && !mNpcs.empty() && !mBaseItems.empty() && !mAffixes.empty(); }
+    bool DiabloExe::isLoaded() const { return !mMonsters.empty() && !mNpcs.empty() && !mBaseItems.empty() && !mMagicItemEffects.empty(); }
 }

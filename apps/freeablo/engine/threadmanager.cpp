@@ -1,18 +1,16 @@
 #include "threadmanager.h"
-
-#include <chrono>
-#include <iostream>
-
-#include <input/inputmanager.h>
-
 #include "../farender/renderer.h"
+#include "debugsettings.h"
+#include <chrono>
+#include <input/inputmanager.h>
+#include <iostream>
 
 namespace Engine
 {
-    ThreadManager* ThreadManager::mThreadManager = NULL;
+    ThreadManager* ThreadManager::mThreadManager = nullptr;
     ThreadManager* ThreadManager::get() { return mThreadManager; }
 
-    ThreadManager::ThreadManager() : mRenderState(NULL), mAudioManager(50, 100) { mThreadManager = this; }
+    ThreadManager::ThreadManager() : mQueue(100), mRenderState(nullptr), mAudioManager(50, 100) { mThreadManager = this; }
 
     void ThreadManager::run()
     {
@@ -20,43 +18,46 @@ namespace Engine
         Input::InputManager* inputManager = Input::InputManager::get();
         FARender::Renderer* renderer = FARender::Renderer::get();
 
-        Message message;
-
         auto last = std::chrono::system_clock::now();
         size_t numFrames = 0;
 
         while (true)
         {
-            mSpritesToPreload.clear();
-
-            while (mQueue.pop(message))
-                handleMessage(message);
+            while (mQueue.front())
+            {
+                handleMessage(*mQueue.front());
+                mQueue.pop();
+            }
 
             inputManager->poll();
 
-            if (!renderer->renderFrame(mRenderState, mSpritesToPreload))
+            if (!renderer->renderFrame(mRenderState))
                 break;
 
             auto now = std::chrono::system_clock::now();
-            numFrames++;
+            if (mRenderState)
+                numFrames++;
 
             size_t duration =
                 static_cast<size_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch() - last.time_since_epoch()).count());
 
             if (duration >= MAXIMUM_DURATION_IN_MS)
             {
-                std::cout << "FPS: " << ((float)numFrames) / (((float)duration) / MAXIMUM_DURATION_IN_MS) << std::endl;
+                std::stringstream ss;
+                ss << "(" << ((float)numFrames) / (((float)duration) / MAXIMUM_DURATION_IN_MS) << " FPS)";
+                Render::setWindowTitle(Render::getWindowTitle() + " " + ss.str());
                 numFrames = 0;
                 last = now;
             }
         }
-
-        renderer->cleanup();
     }
 
     void ThreadManager::playMusic(const std::string& path)
     {
-        Message message;
+        if (DebugSettings::DisableMusic)
+            return;
+
+        Message message = {};
         message.type = ThreadState::PLAY_MUSIC;
         message.data.musicPath = new std::string(path);
 
@@ -65,13 +66,13 @@ namespace Engine
 
     void ThreadManager::playSound(const std::string& path)
     {
-        if (path == "")
+        if (path.empty())
         {
             std::cerr << "Attempt to play invalid sound!" << std::endl;
             return;
         }
 
-        Message message;
+        Message message = {};
         message.type = ThreadState::PLAY_SOUND;
         message.data.soundPath = new std::string(path);
 
@@ -80,25 +81,18 @@ namespace Engine
 
     void ThreadManager::stopSound()
     {
-        Message message;
+        Message message = {};
         message.type = ThreadState::STOP_SOUND;
         mQueue.push(message);
     }
 
+    bool ThreadManager::isPlayingSound() const { return mAudioManager.isPlayingSound(); }
+
     void ThreadManager::sendRenderState(FARender::RenderState* state)
     {
-        Message message;
+        Message message = {};
         message.type = ThreadState::RENDER_STATE;
         message.data.renderState = state;
-
-        mQueue.push(message);
-    }
-
-    void ThreadManager::sendSpritesForPreload(std::vector<uint32_t> sprites)
-    {
-        Message message;
-        message.type = ThreadState::PRELOAD_SPRITES;
-        message.data.preloadSpriteIds = new std::vector<uint32_t>(sprites);
 
         mQueue.push(message);
     }
@@ -133,12 +127,6 @@ namespace Engine
                     mRenderState->ready = true;
 
                 mRenderState = message.data.renderState;
-                break;
-            }
-            case ThreadState::PRELOAD_SPRITES:
-            {
-                mSpritesToPreload.insert(mSpritesToPreload.end(), message.data.preloadSpriteIds->begin(), message.data.preloadSpriteIds->end());
-                delete message.data.preloadSpriteIds;
                 break;
             }
         }

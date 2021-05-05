@@ -1,10 +1,5 @@
-
 #pragma once
-
-namespace Misc
-{
-    struct Point;
-}
+#include <misc/simplevec2.h>
 
 namespace Input
 {
@@ -31,6 +26,13 @@ namespace Engine
         toggleQuests,
         toggleCharacterInfo,
         toggleSpellbook,
+        toggleSpellSelection,
+        spellHotkeyF5,
+        spellHotkeyF6,
+        spellHotkeyF7,
+        spellHotkeyF8,
+        toggleTextureFiltering,
+        toggleDrawGrid,
 
         max,
     };
@@ -39,7 +41,10 @@ namespace Engine
     {
         MOUSE_RELEASE,
         MOUSE_DOWN,
+        RIGHT_MOUSE_RELEASE,
+        RIGHT_MOUSE_DOWN,
         MOUSE_MOVE,
+        MOUSE_WHEEL,
     };
 
     class KeyboardInputObserverInterface
@@ -54,7 +59,7 @@ namespace Engine
     class MouseInputObserverInterface
     {
     public:
-        virtual void notify(MouseInputAction action, Misc::Point mousePosition, bool mouseDown, const Input::KeyboardModifiers& modifiers) = 0;
+        virtual void notify(MouseInputAction action, Vec2i mousePosition, Vec2i mouseWheelDelta, bool mouseDown, const Input::KeyboardModifiers& modifiers) = 0;
         virtual ~MouseInputObserverInterface() = default;
     };
 }

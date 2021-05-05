@@ -1,5 +1,4 @@
 #include "position.h"
-
 #include "../fasavegame/gameloader.h"
 #include "world.h"
 #include <algorithm>
@@ -7,69 +6,104 @@
 
 namespace FAWorld
 {
-    Position::Position(FASaveGame::GameLoader& loader)
+    Position::Position(Misc::Point point, Misc::Direction direction)
+        : mCurrent(point), mFractionalPos(Vec2Fix(point) + Vec2Fix(FixedPoint("0.5"), FixedPoint("0.5"))), mDirection(direction)
     {
-        mDist = loader.load<int32_t>();
-        mDirection = static_cast<Misc::Direction>(loader.load<int32_t>());
-        mMoving = loader.load<bool>();
-
-        int32_t first, second;
-        first = loader.load<int32_t>();
-        second = loader.load<int32_t>();
-        mCurrent = std::make_pair(first, second);
     }
 
-    void Position::save(FASaveGame::GameSaver& saver)
+    Position::Position(Vec2Fix point, Misc::Direction direction) : mCurrent(point), mFractionalPos(point), mDirection(direction) {}
+
+    Position::Position(FASaveGame::GameLoader& loader)
+    {
+        mDirection = Misc::Direction(loader);
+        mMovementType = static_cast<MovementType>(loader.load<int32_t>());
+        mCurrent = Misc::Point(loader);
+        mFractionalPos = Vec2Fix(loader);
+    }
+
+    void Position::save(FASaveGame::GameSaver& saver) const
     {
         Serial::ScopedCategorySaver cat("Position", saver);
 
-        saver.save(mDist);
-        saver.save(static_cast<int32_t>(mDirection));
-        saver.save(mMoving);
-        saver.save(mCurrent.first);
-        saver.save(mCurrent.second);
+        mDirection.save(saver);
+        saver.save(static_cast<int32_t>(mMovementType));
+        mCurrent.save(saver);
+        mFractionalPos.save(saver);
     }
 
-    void Position::update()
+    FixedPoint Position::update(FixedPoint moveDistance)
     {
-        if (mMoving)
+        if (isMoving())
         {
-            mDist += static_cast<int32_t>((FAWorld::World::getSecondsPerTick() * 250).intPart());
-
-            if (mDist >= 100)
+            Vec2Fix vectorToDest;
+            if (mMovementType == MovementType::GridLocked)
             {
-                mCurrent = next();
-                mDist = 0;
+                Vec2Fix fractionalNext = Vec2Fix(next()) + Vec2Fix(FixedPoint("0.5"), FixedPoint("0.5"));
+                vectorToDest = fractionalNext - mFractionalPos;
             }
+            else
+            {
+                // https://wheybags.gitlab.io/jarulfs-guide/#spell-and-arrow-speeds
+                // Techhnically, this isn't quite correct, as in the original game projectiles essentially
+                // moved through the world in "screen coordinates", and we move in the game's isometric
+                // space, but honestly I think this way is better anyway.
+                FixedPoint isometricDegrees = mDirection.getIsometricDegrees();
+                vectorToDest = Vec2Fix(FixedPoint::cos_degrees(isometricDegrees), FixedPoint::sin_degrees(isometricDegrees));
+            }
+
+            Vec2Fix movement = vectorToDest;
+            movement.normalise();
+            movement *= moveDistance;
+
+            mFractionalPos += movement;
+
+            if (mMovementType == MovementType::GridLocked)
+            {
+                FixedPoint vectorToDestMagnitudeSquared = vectorToDest.magnitudeSquared();
+                if (movement.magnitudeSquared() >= vectorToDestMagnitudeSquared)
+                {
+                    mCurrent = next();
+                    mFractionalPos = Vec2Fix(mCurrent) + Vec2Fix(FixedPoint("0.5"), FixedPoint("0.5"));
+                    stopMoving();
+
+                    return moveDistance - vectorToDestMagnitudeSquared.sqrt();
+                }
+            }
+            else
+            {
+                mCurrent = Misc::Point(mFractionalPos);
+            }
+
+            return 0;
         }
+
+        return moveDistance;
     }
 
     void Position::setDirection(Misc::Direction mDirection) { this->mDirection = mDirection; }
 
-    std::pair<int32_t, int32_t> Position::current() const { return mCurrent; }
+    Misc::Point Position::current() const { return mCurrent; }
 
     bool Position::isNear(const Position& other) const
     {
-        return std::max(std::abs(mCurrent.first - other.mCurrent.first), std::abs(mCurrent.second - other.mCurrent.second)) <= 1;
+        return std::max(std::abs(current().x - other.current().x), std::abs(current().y - other.current().y)) <= 1;
     }
 
-    std::pair<int32_t, int32_t> Position::next() const
+    Misc::Point Position::next() const
     {
-        if (!mMoving)
-            return mCurrent;
+        if (!isMoving())
+            return current();
 
-        return Misc::getNextPosByDir(mCurrent, mDirection);
+        return Misc::getNextPosByDir(current(), mDirection);
     }
 
-    void Position::stop()
+    void Position::stopMoving() { mMovementType = MovementType::Stopped; }
+
+    void Position::gridMoveInDirection(Misc::Direction8 direction)
     {
-        mDist = 0;
-        mMoving = false;
+        setDirection(direction);
+        mMovementType = MovementType::GridLocked;
     }
 
-    void Position::start()
-    {
-        mDist = 0;
-        mMoving = true;
-    }
+    void Position::setFreeMovement() { mMovementType = MovementType::FreeMovement; }
 }

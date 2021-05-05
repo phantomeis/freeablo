@@ -2,7 +2,6 @@
 #include "../actor.h"
 #include "../itemmap.h"
 #include "attackstate.h"
-#include <misc/vec2fix.h>
 
 namespace FAWorld
 {
@@ -10,15 +9,22 @@ namespace FAWorld
     {
         const std::string BaseState::typeId = "actor-state-base-state";
 
-        boost::optional<StateChange> BaseState::update(Actor& actor, bool noclip)
+        std::optional<StateChange> BaseState::update(Actor& actor, bool noclip)
         {
             UNUSED_PARAM(noclip);
-            boost::optional<StateChange> ret;
+            std::optional<StateChange> ret;
 
-            if (auto direction = actor.mMeleeAttackRequestedDirection)
+            if (auto pos = actor.mForceAttackRequestedPoint)
             {
-                actor.mMeleeAttackRequestedDirection = boost::none;
-                return StateChange{StateOperation::push, new ActorState::MeleeAttackState(*direction)};
+                actor.mForceAttackRequestedPoint = std::nullopt;
+                auto attackState = actor.hasRangedWeaponEquipped() ? new RangedAttackState(*pos) : new MeleeAttackState(*pos);
+                return StateChange{StateOperation::push, attackState};
+            }
+
+            if (auto req = actor.mCastSpellRequest)
+            {
+                actor.mCastSpellRequest = std::nullopt;
+                return StateChange{StateOperation::push, new SpellAttackState(req->first, req->second)};
             }
 
             switch (actor.mTarget.getType())
@@ -29,18 +35,24 @@ namespace FAWorld
 
                     if (actor.canInteractWith(target))
                     {
+                        // Attack with ranged
+                        if (actor.canIAttack(target) && actor.hasRangedWeaponEquipped())
+                        {
+                            auto targetPos = target->getPos().current();
+                            ret = StateChange{StateOperation::push, new RangedAttackState(targetPos)};
+                            actor.mTarget.clear();
+                        }
                         // move to the actor, if we're not already on our way
-                        if (!actor.getPos().isNear(target->getPos()))
+                        else if (!actor.getPos().isNear(target->getPos()))
                             actor.mMoveHandler.setDestination(target->getPos().current());
                         else // and interact them if in range
                         {
                             if (actor.canIAttack(target))
                             {
                                 auto targetPos = target->getPos().current();
-                                auto myPos = actor.getPos().current();
-                                ret = StateChange{
-                                    StateOperation::push,
-                                    new MeleeAttackState(Vec2Fix(targetPos.first - myPos.first, targetPos.second - myPos.second).getIsometricDirection())};
+                                auto attackState = actor.hasRangedWeaponEquipped() ? new RangedAttackState(targetPos) : new MeleeAttackState(targetPos);
+                                ret = StateChange{StateOperation::push, attackState};
+                                actor.mTarget.clear();
                             }
                         }
                     }
@@ -56,23 +68,48 @@ namespace FAWorld
                 {
                     Target::ItemTarget target = actor.mTarget.get<Target::ItemTarget>();
 
-                    auto tile = target.item->getTile();
-                    if (actor.getPos().isNear({tile.x, tile.y}))
+                    if (actor.getPos().isNear(Position(target.itemLocation)))
                     {
                         actor.pickupItem(target);
                         actor.mTarget.clear();
                     }
                     else
                     {
-                        actor.mMoveHandler.setDestination({tile.x, tile.y}, true);
+                        actor.mMoveHandler.setDestination(target.itemLocation, true);
                     }
+
+                    break;
+                }
+
+                case Target::Type::Door:
+                {
+                    Misc::Point targetDoor = actor.mTarget.get<Misc::Point>();
+
+                    if (!actor.getLevel()->isDoor(targetDoor))
+                    {
+                        actor.mTarget.clear();
+                        break;
+                    }
+
+                    if (actor.getPos().isNear(Position(targetDoor)))
+                    {
+                        actor.getLevel()->activateDoor(targetDoor);
+                        actor.mTarget.clear();
+                    }
+                    else
+                    {
+                        actor.mMoveHandler.setDestination(targetDoor, true);
+                    }
+
+                    break;
                 }
 
                 case Target::Type::None:
                     break;
             }
 
-            actor.mMoveHandler.update(actor.getId());
+            actor.mMoveHandler.update(actor);
+            debug_assert(actor.getLevel()->isPassable(actor.mMoveHandler.getCurrentPosition().next(), &actor));
 
             AnimState anim = actor.mAnimation.getCurrentAnimation();
             if (actor.mMoveHandler.moving() && anim != AnimState::walk)

@@ -1,11 +1,16 @@
 #pragma once
-
 #include <iterator>
 
 template <typename EnumT> class enum_range_t;
 
-template <typename EnumT> class enum_range_iterator : public std::iterator<std::forward_iterator_tag, EnumT>
+template <typename EnumT> class enum_range_iterator
 {
+    using iterator_category = std::forward_iterator_tag;
+    using value_type = EnumT;
+    using difference_type = ptrdiff_t;
+    using pointer = EnumT*;
+    using reference = EnumT&;
+
     EnumT m_value;
 
 public:

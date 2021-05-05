@@ -3,9 +3,12 @@
 #include "actor.h"
 #include "actorstats.h"
 #include "itemmap.h"
+#include "missile/missile.h"
 #include "world.h"
 #include <diabloexe/diabloexe.h>
+#include <engine/debugsettings.h>
 #include <misc/assert.h>
+#include <render/spritegroup.h>
 
 namespace FAWorld
 {
@@ -32,9 +35,11 @@ namespace FAWorld
 
         release_assert(loader.currentlyLoadingLevel == this);
         loader.currentlyLoadingLevel = nullptr;
+
+        actorMapRefresh();
     }
 
-    void GameLevel::save(FASaveGame::GameSaver& saver)
+    void GameLevel::save(FASaveGame::GameSaver& saver) const
     {
         Serial::ScopedCategorySaver cat("GameLevel", saver);
 
@@ -58,17 +63,49 @@ namespace FAWorld
             delete mActors[i];
     }
 
-    Level::MinPillar GameLevel::getTile(size_t x, size_t y) { return mLevel.get(x, y); }
+    Level::MinPillar GameLevel::getTile(const Misc::Point& point) const { return mLevel.get(point); }
 
     int32_t GameLevel::width() const { return mLevel.width(); }
 
     int32_t GameLevel::height() const { return mLevel.height(); }
 
-    const std::pair<int32_t, int32_t> GameLevel::upStairsPos() const { return mLevel.upStairsPos(); }
+    bool GameLevel::isDoor(const Misc::Point& point) const { return mLevel.isDoor(point); }
+    bool GameLevel::activateDoor(const Misc::Point& point)
+    {
+#ifndef NDEBUG
+        for (const auto& actor : mActors)
+        {
+            if (!actor->isDead())
+            {
+                debug_assert(isPassable(actor->mMoveHandler.getCurrentPosition().current(), actor));
+                debug_assert(isPassable(actor->mMoveHandler.getCurrentPosition().next(), actor));
+                debug_assert(getActorAt(actor->mMoveHandler.getCurrentPosition().current()) == actor);
+                debug_assert(getActorAt(actor->mMoveHandler.getCurrentPosition().next()) == actor);
+            }
+        }
+#endif
 
-    const std::pair<int32_t, int32_t> GameLevel::downStairsPos() const { return mLevel.downStairsPos(); }
+        Actor* actorInDoorway = getActorAt(point);
+        if (actorInDoorway)
+            return false;
 
-    void GameLevel::activate(size_t x, size_t y) { mLevel.activate(x, y); }
+        bool retval = mLevel.activateDoor(point);
+
+#ifndef NDEBUG
+        for (const auto& actor : mActors)
+        {
+            if (!actor->isDead())
+            {
+                debug_assert(isPassable(actor->mMoveHandler.getCurrentPosition().current(), actor));
+                debug_assert(isPassable(actor->mMoveHandler.getCurrentPosition().next(), actor));
+                debug_assert(getActorAt(actor->mMoveHandler.getCurrentPosition().current()) == actor);
+                debug_assert(getActorAt(actor->mMoveHandler.getCurrentPosition().next()) == actor);
+            }
+        }
+#endif
+
+        return retval;
+    }
 
     int32_t GameLevel::getNextLevel() { return mLevel.getNextLevel(); }
 
@@ -76,34 +113,83 @@ namespace FAWorld
 
     void GameLevel::update(bool noclip)
     {
-        for (size_t i = 0; i < mActors.size(); i++)
-        {
-            Actor* actor = mActors[i];
-
-            actorMapRemove(actor);
+        for (auto& actor : mActors)
             actor->update(noclip);
-            actorMapInsert(actor);
-        }
-
-        actorMapRefresh();
 
         for (auto& p : mItemMap->mItems)
             p.second.update();
+
+        if (DebugSettings::DebugLevelTransitions)
+        {
+            for (const Level::LevelTransitionArea& transition : {upStairsArea(), downStairsArea()})
+            {
+                for (int32_t y = transition.offset.y; y < transition.offset.y + transition.dimensions.h; y++)
+                {
+                    for (int32_t x = transition.offset.x; x < transition.offset.x + transition.dimensions.w; x++)
+                    {
+                        Render::Color highlightColor = Render::Colors::green;
+
+                        if (transition.triggerMask.get(x - transition.offset.x, y - transition.offset.y))
+                            highlightColor = Render::Colors::red;
+
+                        highlightColor.a = 0.1f;
+                        FARender::Renderer::get()->mTmpDebugRenderData.push_back(TileData{{x, y}, highlightColor});
+                    }
+                }
+
+                Vec2Fix centre = Vec2Fix(transition.offset + transition.playerSpawnOffset) + Vec2Fix(FixedPoint("0.5"), FixedPoint("0.5"));
+                FARender::Renderer::get()->mTmpDebugRenderData.push_back(PointData{centre, Render::Colors::red, 2});
+
+                centre = Vec2Fix(transition.offset + transition.exitOffset) + Vec2Fix(FixedPoint("0.5"), FixedPoint("0.5"));
+                FARender::Renderer::get()->mTmpDebugRenderData.push_back(PointData{centre, Render::Colors::green, 2});
+            }
+        }
+    }
+
+    void GameLevel::insertActor(Actor* actor)
+    {
+        if (actor->isDead())
+            return;
+
+        bool found = false;
+        for (const auto actorInLevel : mActors)
+        {
+            if (actor == actorInLevel)
+                found = true;
+        }
+
+        if (!found)
+            mActors.push_back(actor);
+
+        actorMapInsert(actor);
     }
 
     void GameLevel::actorMapInsert(Actor* actor)
     {
+        Actor* blocking = nullptr;
+        if (mActorMap2D.count(actor->getPos().current()))
+            blocking = mActorMap2D[actor->getPos().current()];
+        debug_assert(blocking == actor || blocking == nullptr || (blocking->getWorld()->mLoading || blocking->isDead()));
+
         mActorMap2D[actor->getPos().current()] = actor;
+
         if (actor->getPos().isMoving())
+        {
+            if (mActorMap2D.count(actor->getPos().next()))
+                blocking = mActorMap2D[actor->getPos().next()];
+            debug_assert(blocking == actor || blocking == nullptr || (blocking->getWorld()->mLoading || blocking->isDead()));
+
             mActorMap2D[actor->getPos().next()] = actor;
+        }
     }
 
-    void GameLevel::actorMapRemove(Actor* actor)
+    void GameLevel::actorMapRemove(const Actor* actor, Misc::Point point)
     {
-        if (mActorMap2D[actor->getPos().current()] == actor)
-            mActorMap2D.erase(actor->getPos().current());
-        if (actor->getPos().isMoving() && mActorMap2D[actor->getPos().next()] == actor)
-            mActorMap2D.erase(actor->getPos().next());
+#ifndef NDEBUG
+        Actor* currentlyPresent = mActorMap2D[point];
+        debug_assert(currentlyPresent == actor || currentlyPresent == nullptr);
+#endif
+        mActorMap2D.erase(point);
     }
 
     void GameLevel::actorMapClear() { mActorMap2D.clear(); }
@@ -115,33 +201,65 @@ namespace FAWorld
             actorMapInsert(mActors[i]);
     }
 
-    bool GameLevel::isPassable(int x, int y) const
+    Misc::Point GameLevel::getFreeSpotNear(Misc::Point point, int32_t radius, const std::function<bool(const Misc::Point& point)>& additionalConstraints) const
     {
-        if (x > 0 && x < width() && y > 0 && y < height() && !mLevel.get(x, y).passable())
-            return false;
+        // partially based on https://stackoverflow.com/a/398302
 
-        FAWorld::Actor* actor = getActorAt(x, y);
-        return actor == NULL || actor->isPassable();
+        int32_t xOffset = 0;
+        int32_t yOffset = 0;
+
+        int32_t dx = 0;
+        int32_t dy = -1;
+
+        while (xOffset <= radius && yOffset <= radius)
+        {
+            Misc::Point targetPoint = point + Misc::Point{xOffset, yOffset};
+            if (targetPoint.x >= 0 && targetPoint.x < width() && targetPoint.y >= 0 && targetPoint.y < height())
+            {
+                if (isPassable(targetPoint, nullptr) && (additionalConstraints == nullptr || additionalConstraints(targetPoint)))
+                    return targetPoint;
+            }
+
+            if (xOffset == yOffset || (xOffset < 0 && xOffset == -yOffset) || (xOffset > 0 && xOffset == 1 - yOffset))
+            {
+                int32_t tmp = dx;
+                dx = -dy;
+                dy = tmp;
+            }
+
+            xOffset = xOffset + dx;
+            yOffset = yOffset + dy;
+        }
+
+        return Misc::Point::invalid();
     }
 
-    Actor* GameLevel::getActorAt(int32_t x, int32_t y) const
+    bool GameLevel::isPassable(const Misc::Point& point, const FAWorld::Actor* forActor) const
     {
-        auto it = mActorMap2D.find(std::pair<int32_t, int32_t>(x, y));
+        // Special hack because griswold spawns on an unpassable tile.
+        // TODO: This should be fixed later by a patch on the town level data.
+        if (forActor && forActor->mIsTowner)
+            return true;
+
+        if (point.x < 0 || point.x >= width() || point.y < 0 || point.y >= height() || !mLevel.get(point).passable())
+            return false;
+
+        FAWorld::Actor* actor = getActorAt(point);
+        return actor == nullptr || actor == forActor;
+    }
+
+    Actor* GameLevel::getActorAt(const Misc::Point& point) const
+    {
+        auto it = mActorMap2D.find(point);
         if (it == mActorMap2D.end())
             return nullptr;
 
         return it->second;
     }
 
-    void GameLevel::addActor(Actor* actor)
-    {
-        mActors.push_back(actor);
-        actorMapInsert(actor);
-    }
-
-    static Cel::Colour friendHoverColor() { return {180, 110, 110, true}; }
-    static Cel::Colour enemyHoverColor() { return {164, 46, 46, true}; }
-    static Cel::Colour itemHoverColor() { return {185, 170, 119, true}; }
+    static ByteColour friendHoverColor() { return {180, 110, 110, true}; }
+    static ByteColour enemyHoverColor() { return {164, 46, 46, true}; }
+    static ByteColour itemHoverColor() { return {185, 170, 119, true}; }
 
     void GameLevel::fillRenderState(FARender::RenderState* state, Actor* displayedActor, const HoverStatus& hoverStatus)
     {
@@ -152,30 +270,39 @@ namespace FAWorld
         {
             auto tmp = mActors[i]->mAnimation.getCurrentRealFrame();
 
-            FARender::FASpriteGroup* sprite = tmp.first;
+            Render::SpriteGroup* sprite = tmp.first;
             int32_t frame = tmp.second;
-            boost::optional<Cel::Colour> hoverColor;
+            std::optional<ByteColour> hoverColor;
             if (mActors[i]->getId() == hoverStatus.hoveredActorId)
                 hoverColor = mActors[i]->isEnemy(displayedActor) ? enemyHoverColor() : friendHoverColor();
             // offset the sprite for the current direction of the actor
 
             if (sprite)
             {
-                frame += static_cast<int32_t>(mActors[i]->getPos().getDirection()) * sprite->getAnimLength();
+                frame += static_cast<int32_t>(mActors[i]->getPos().getDirection().getDirection8()) * sprite->getAnimationLength();
                 state->mObjects.push_back({sprite, static_cast<uint32_t>(frame), mActors[i]->getPos(), hoverColor});
             }
+        }
 
-            for (auto& p : mItemMap->mItems)
-            {
-                auto sf = p.second.getSpriteFrame();
-                FARender::ObjectToRender o;
-                o.spriteGroup = sf.first;
-                o.frame = sf.second;
-                o.position = {p.first.x, p.first.y};
-                if (p.first == hoverStatus.hoveredItemTile)
-                    o.hoverColor = itemHoverColor();
-                state->mItems.push_back(o);
-            }
+        for (const auto& graphic : mMissileGraphics)
+        {
+            auto tmp = graphic->getCurrentFrame();
+            auto spriteGroup = tmp.first;
+            auto frame = tmp.second;
+            if (spriteGroup)
+                state->mObjects.push_back({spriteGroup, static_cast<uint32_t>(frame), graphic->mCurPos, std::nullopt});
+        }
+
+        for (auto& p : mItemMap->mItems)
+        {
+            auto sf = p.second.getSpriteFrame();
+            FARender::ObjectToRender o;
+            o.spriteGroup = sf.first;
+            o.frame = sf.second;
+            o.position = Position(p.first);
+            if (p.first == hoverStatus.hoveredItemTile)
+                o.hoverColor = itemHoverColor();
+            state->mItems.push_back(o);
         }
     }
 
@@ -186,20 +313,43 @@ namespace FAWorld
             if (*i == actor)
             {
                 mActors.erase(i);
-                actorMapRemove(actor);
+                actorMapRemove(actor, actor->getPos().current());
+                actorMapRemove(actor, actor->getPos().next());
                 return;
             }
         }
         release_assert(false && "tried to remove actor that isn't in level");
     }
 
-    bool GameLevel::isPassableFor(int x, int y, const Actor* actor) const
-    {
-        auto actorAtPos = getActorAt(x, y);
-        return mLevel.get(x, y).passable() && (actorAtPos == nullptr || actorAtPos == actor || actorAtPos->isPassable());
-    }
+    bool GameLevel::dropItem(std::unique_ptr<Item>& item, const Actor& actor, Misc::Point tile) { return mItemMap->dropItem(item, actor, tile); }
 
-    bool GameLevel::dropItem(std::unique_ptr<Item>&& item, const Actor& actor, const Tile& tile) { return mItemMap->dropItem(move(item), actor, tile); }
+    bool GameLevel::dropItemClosestEmptyTile(std::unique_ptr<Item>& item, const Actor& actor, const Misc::Point& position, Misc::Direction direction)
+    {
+        auto tryDrop = [&](Misc::Point pos) {
+            bool res = false;
+            if (isPassable(pos, &actor) && !mItemMap->getItemAt(pos))
+                res = dropItem(item, actor, pos);
+            return res;
+        };
+
+        if (direction.isNone())
+        {
+            if (tryDrop(position))
+                return true;
+            direction = Misc::Direction(Misc::Direction8::south);
+        }
+
+        for (auto diffDegrees : {0, -45, 45})
+        {
+            Misc::Direction dir = direction;
+            dir.adjust(diffDegrees);
+            Misc::Point pos = Misc::getNextPosByDir(position, dir);
+            if (tryDrop(pos))
+                return true;
+        }
+
+        return tryDrop(position);
+    }
 
     Actor* GameLevel::getActorById(int32_t id)
     {
@@ -209,10 +359,8 @@ namespace FAWorld
                 return actor;
         }
 
-        return NULL;
+        return nullptr;
     }
-
-    void GameLevel::getActors(std::vector<Actor*>& actors) { actors.insert(actors.end(), mActors.begin(), mActors.end()); }
 
     GameLevel::GameLevel(World& world) : mWorld(world) {}
 

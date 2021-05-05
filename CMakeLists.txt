@@ -1,75 +1,46 @@
-cmake_minimum_required (VERSION 2.8.11)
+cmake_minimum_required (VERSION 3.11)
 
-include("cmake/HunterGate.cmake")
-HunterGate(
-    URL "https://github.com/ruslo/hunter/archive/v0.20.64.tar.gz"
-    SHA1 "7b830dfda7a094b2af15f44b24ebd2489404d880"
-    LOCAL
-)
+## Windows Config ##
+if (WIN32)
+    set (CMAKE_SYSTEM_VERSION 8.1 CACHE STRING INTERNAL FORCE)
+
+    set(desired_generators "Visual Studio 16 2019")
+
+    if (NOT "${CMAKE_GENERATOR}" IN_LIST desired_generators)
+        message(FATAL_ERROR "Incorrect generator, please run cmake with: -G GENERATOR, where GENERATOR is one of: ${desired_generators}")
+    endif()
+endif()
 
 project (Freeablo)
 
-set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/")
-
-set(HUNTER_LIBS "")
-
-hunter_add_package(SDL2)
-find_Package(SDL2 CONFIG REQUIRED)
-set(HUNTER_LIBS ${HUNTER_LIBS} SDL2::SDL2)
-
-hunter_add_package(SDL_image)
-find_package(SDL_image CONFIG REQUIRED)
-set(HUNTER_LIBS ${HUNTER_LIBS} SDL_image::SDL_image)
-
-hunter_add_package(SDL_mixer)
-find_package(SDL_mixer CONFIG REQUIRED)
-set(HUNTER_LIBS ${HUNTER_LIBS} SDL_mixer::SDL_mixer)
-
-hunter_add_package(PNG)
-find_package(PNG CONFIG REQUIRED)
-set(HUNTER_LIBS ${HUNTER_LIBS} PNG::png)
-
-hunter_add_package(enet)
-find_package(enet CONFIG REQUIRED)
-set(HUNTER_LIBS ${HUNTER_LIBS} enet::enet)
-
-hunter_add_package(ZLIB)
-find_package(ZLIB CONFIG REQUIRED)
-set(HUNTER_LIBS ${HUNTER_LIBS} ZLIB::zlib)
-
-hunter_add_package(stormlib)
-find_package(stormlib CONFIG REQUIRED)
-set(HUNTER_LIBS ${HUNTER_LIBS} stormlib::stormlib)
-
-hunter_add_package(Boost COMPONENTS filesystem system program_options date_time regex)
-find_package(Boost CONFIG REQUIRED  filesystem system program_options date_time regex)
-set(HUNTER_BOOST_LIBS Boost::filesystem Boost::system Boost::program_options Boost::date_time Boost::regex)
-set(HUNTER_LIBS ${HUNTER_LIBS} ${HUNTER_BOOST_LIBS})
-
-Find_Package(OpenGL REQUIRED)
-
 set(FA_COMPILER_FLAGS "")
 
-# Use C++11
-if (CMAKE_VERSION VERSION_LESS "3.1")
-    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        set (CMAKE_CXX_FLAGS "--std=gnu++11 ${CMAKE_CXX_FLAGS}")
-    endif ()
-else ()
-    set (CMAKE_CXX_STANDARD 11)
-endif ()
+set (CMAKE_CXX_STANDARD 17)
+
 if(WIN32)
 	add_definitions(-DNOMINMAX) # http://stackoverflow.com/questions/5004858/stdmin-gives-error
 endif()
 
-option (FA_TREAT_WARNINGS_AS_ERRORS "Treat warnings as errors")
+option (FA_TREAT_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
+option (DEBUG_GRAPHICS "Debug graphics code" OFF)
 
-if(UNIX)
+if (DEBUG_GRAPHICS)
+  set(FA_COMPILER_FLAGS "${FA_COMPILER_FLAGS} -DDEBUG_GRAPHICS")
+endif()
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set(FA_COMPILER_FLAGS "${FA_COMPILER_FLAGS} -Wall -pedantic -Wextra -Wno-unknown-pragmas -Wno-missing-braces")
     SET(CMAKE_INCLUDE_SYSTEM_FLAG_CXX "-isystem ")
     if (FA_TREAT_WARNINGS_AS_ERRORS)
         set(FA_COMPILER_FLAGS "${FA_COMPILER_FLAGS} -Werror")
     endif()
+endif()
+
+if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
+    SET(GCC_LINKER_FLAGS "-static-libstdc++ -static-libgcc")
+
+    SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${GCC_LINKER_FLAGS}")
+    SET(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${GCC_LINKER_FLAGS}")
 endif()
 
 if(MSVC)
@@ -91,6 +62,7 @@ if(MSVC)
     if (FA_TREAT_WARNINGS_AS_ERRORS)
         set(FA_COMPILER_FLAGS "${FA_COMPILER_FLAGS} /WX")
     endif()
+
 endif()
 
 #TODO: get rid of this?
@@ -115,6 +87,17 @@ add_subdirectory(apps/celview)
 add_subdirectory(apps/mpqtool)
 add_subdirectory(apps/exedump)
 add_subdirectory(apps/launcher)
-add_subdirectory(apps/fontgenerator)
-add_subdirectory(apps/findpath)
 add_subdirectory(test)
+
+if(MSVC)
+    set_property(TARGET freeablo PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    set_property(TARGET celview PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    set_property(TARGET exedump PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    set_property(TARGET launcher PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    set_property(TARGET unit_tests PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()
+
+install(DIRECTORY resources/ DESTINATION resources
+        PATTERN "settings-user.ini" EXCLUDE)
+
+install(FILES changelog.md DESTINATION .)

@@ -1,29 +1,25 @@
-
 #pragma once
-
-#include <stddef.h>
-#include <stdint.h>
-
+#include "../faworld/position.h"
+#include "debugrenderdata.h"
+#include "diabloexe/diabloexe.h"
+#include "fontinfo.h"
+#include "levelrenderer.h"
+#include "spriteloader.h"
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <nuklearmisc/nuklearframedump.h>
+#include <render/cursor.h>
+#include <render/render.h>
 #include <tuple>
 
-#include <render/render.h>
-
-#include "../faworld/position.h"
-
-#include "boost/container/flat_map.hpp"
-#include "diabloexe/diabloexe.h"
-#include "fontinfo.h"
-#include "spritemanager.h"
-#include <memory>
-
-namespace Render
+namespace DiabloExe
 {
-    enum class CursorHotspotLocation;
+    class DiabloExe;
 }
 
 namespace FAWorld
@@ -34,57 +30,62 @@ namespace FAWorld
 namespace FARender
 {
     class CelFontInfo;
-
     class Renderer;
+    class LevelRenderer;
 
     class Tileset
     {
     private:
-        FASpriteGroup* minTops;
-        FASpriteGroup* minBottoms;
+        Render::SpriteGroup* minTops = nullptr;
+        Render::SpriteGroup* minBottoms = nullptr;
+        Render::SpriteGroup* mSpecialSprites = nullptr;
+        std::map<int32_t, int32_t> mSpecialSpriteMap;
         friend class Renderer;
     };
 
     struct ObjectToRender
     {
-        FASpriteGroup* spriteGroup;
-        uint32_t frame;
+        Render::SpriteGroup* spriteGroup = nullptr;
+        uint32_t frame = 0;
         FAWorld::Position position;
-        boost::optional<Cel::Colour> hoverColor;
+        std::optional<ByteColour> hoverColor;
     };
 
     class RenderState
     {
     public:
-        std::atomic_bool ready;
+        explicit RenderState(NuklearDevice& nuklearGraphicsData) : ready(true), nuklearData(nuklearGraphicsData) {}
+        RenderState(RenderState&& other) = default;
+
+        struct MoveableAtomicBool
+        {
+            std::atomic_bool val;
+
+            MoveableAtomicBool(bool val) : val(val) {}
+            MoveableAtomicBool(MoveableAtomicBool&& other) : val(other.val.load()) {}
+
+            void operator=(bool newVal) { val = newVal; }
+            operator bool() { return val; }
+        };
+
+        MoveableAtomicBool ready;
 
         FAWorld::Position mPos;
-
         std::vector<ObjectToRender> mItems;
         std::vector<ObjectToRender> mObjects;
-
         NuklearFrameDump nuklearData;
-
         Tileset tileset;
-
-        FAWorld::GameLevel* level;
-
-        FASpriteGroup* mCursorSpriteGroup;
-        uint32_t mCursorFrame;
-
-        bool mCursorEmpty;
-
-        RenderState(Render::NuklearGraphicsContext& nuklearGraphicsData) : ready(true), nuklearData(nuklearGraphicsData.dev) {}
+        FAWorld::GameLevel* level = nullptr;
+        const Render::Cursor* currentCursor = nullptr;
+        DebugRenderData debugData;
     };
-
-    FASpriteGroup* getDefaultSprite();
 
     class Renderer
     {
     public:
         static Renderer* get();
 
-        Renderer(int32_t windowWidth, int32_t windowHeight, bool fullscreen);
+        Renderer(const DiabloExe::DiabloExe& exe, int32_t windowWidth, int32_t windowHeight, bool fullscreen);
         ~Renderer();
 
         void stop();
@@ -95,56 +96,54 @@ namespace FARender
         RenderState* getFreeState(); // ooh ah up de ra
         void setCurrentState(RenderState* current);
 
-        FASpriteGroup* loadImage(const std::string& path);
-        FASpriteGroup* loadServerImage(uint32_t index);
-        void fillServerSprite(uint32_t index, const std::string& path);
-        std::string getPathForIndex(uint32_t index);
-
         Render::Tile getTileByScreenPos(size_t x, size_t y, const FAWorld::Position& screenPos);
 
-        void drawCursor(RenderState* State);
+        void updateCursor(const Render::Cursor* cursor);
 
-        bool renderFrame(RenderState* state, const std::vector<uint32_t>& spritesToPreload); ///< To be called only by Engine::ThreadManager
-        void cleanup();                                                                      ///< To be called only by Engine::ThreadManager
-        Misc::Point cursorSize() const { return mCursorSize; }
+        bool renderFrame(RenderState* state); ///< To be called only by Engine::ThreadManager
 
         nk_context* getNuklearContext() { return &mNuklearContext; }
 
         void getWindowDimensions(int32_t& w, int32_t& h);
         void loadFonts(const DiabloExe::DiabloExe& exe);
 
-        bool getAndClearSpritesNeedingPreloading(std::vector<uint32_t>& sprites);
         nk_user_font* smallFont() const;
         nk_user_font* bigTGoldFont() const;
         nk_user_font* goldFont(int height) const;
         nk_user_font* silverFont(int height) const;
 
     private:
-        std::unique_ptr<CelFontInfo> generateCelFont(const std::string& texturePath, const DiabloExe::FontData& fontData, int spacing);
-        std::unique_ptr<PcxFontInfo> generateFont(const std::string& pcxPath, const std::string& binPath);
+        std::unique_ptr<CelFontInfo> generateCelFont(Render::SpriteGroup* fontTexture, const DiabloExe::FontData& fontData, int spacing);
+        std::unique_ptr<PcxFontInfo> generateFont(Render::SpriteGroup* fontTexture, const std::string& binPath, const PcxFontInitData& fontInitData);
+
+    public:
+        SpriteLoader mSpriteLoader;
+        std::unique_ptr<LevelRenderer> mLevelRenderer;
+        DebugRenderData mTmpDebugRenderData;
+        std::unique_ptr<Render::Cursor> mDefaultCursor;
 
     private:
         static Renderer* mRenderer; ///< Singleton instance
 
         std::atomic_bool mDone;
-        Render::LevelObjects mLevelObjects;
-        Render::LevelObjects mItems;
+        LevelObjects mLevelObjects;
+        LevelObjects mItems;
 
-        size_t mNumRenderStates = 15;
-        RenderState* mStates;
+        static constexpr size_t NUM_RENDER_STATES = 15;
+        std::vector<RenderState> mStates;
 
-        SpriteManager mSpriteManager;
-        Misc::Point mCursorSize;
+        const Render::Cursor* mCurrentCursor = nullptr;
 
         volatile bool mAlreadyExited = false;
         std::mutex mDoneMutex;
         std::condition_variable mDoneCV;
 
         nk_context mNuklearContext = nk_context();
-        Render::NuklearGraphicsContext mNuklearGraphicsData = Render::NuklearGraphicsContext();
+        std::unique_ptr<NuklearDevice> mNuklearGraphicsData;
+        std::unique_ptr<Render::SpriteGroup> mNuklearFontTexture;
 
         std::atomic<std::int64_t> mWidthHeightTmp;
         std::unique_ptr<CelFontInfo> mSmallTextFont, mBigTGoldFont;
-        boost::container::flat_map<int, std::unique_ptr<PcxFontInfo>> mGoldFont, mSilverFont;
+        std::map<int, std::unique_ptr<PcxFontInfo>> mGoldFont, mSilverFont;
     };
 }

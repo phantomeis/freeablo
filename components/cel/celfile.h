@@ -1,6 +1,4 @@
-
 #pragma once
-
 #include "celdecoder.h"
 #include "celframe.h"
 #include <stdint.h>
@@ -20,7 +18,8 @@ namespace Cel
         // If normal cel file, returns same as numFrames(), for an archive, the number of frames in each subcel
         int32_t animLength() const;
         int32_t numFrames() const;
-        CelFrame& operator[](int32_t index);
+
+        std::vector<Image> decode();
 
     private:
         CelDecoder mDecoder;

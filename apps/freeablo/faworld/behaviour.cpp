@@ -3,6 +3,7 @@
 #include "actor.h"
 #include "player.h"
 #include <cstdlib>
+#include <engine/debugsettings.h>
 #include <iostream>
 #include <misc/assert.h>
 #include <random/random.h>
@@ -14,8 +15,8 @@ namespace FAWorld
 
     static int32_t squaredDistance(const Position& a, const Position& b)
     {
-        int32_t tmpX = abs(a.current().first - b.current().first);
-        int32_t tmpY = abs(a.current().second - b.current().second);
+        int32_t tmpX = abs(a.current().x - b.current().x);
+        int32_t tmpY = abs(a.current().y - b.current().y);
         return tmpX * tmpX + tmpY * tmpY;
     }
 
@@ -26,6 +27,9 @@ namespace FAWorld
         int minDistance = 99999999;
         for (auto player : actor->getWorld()->getPlayers())
         {
+            if (player->isDead())
+                continue;
+
             int32_t distance = FAWorld::squaredDistance(player->getPos(), actor->getPos());
             if (distance < minDistance)
             {
@@ -39,7 +43,7 @@ namespace FAWorld
 
     BasicMonsterBehaviour::BasicMonsterBehaviour(FASaveGame::GameLoader& loader) { mTicksSinceLastAction = loader.load<Tick>(); }
 
-    void BasicMonsterBehaviour::save(FASaveGame::GameSaver& saver)
+    void BasicMonsterBehaviour::save(FASaveGame::GameSaver& saver) const
     {
         Serial::ScopedCategorySaver cat("BasicMonsterBehaviour", saver);
 
@@ -48,17 +52,31 @@ namespace FAWorld
 
     void BasicMonsterBehaviour::update()
     {
+        if (mActor->mTarget.getType() != Target::Type::None || DebugSettings::EnemiesFrozen)
+            return;
+
         mTicksSinceLastAction++;
 
         if (!mActor->isDead())
         {
             Player* nearest = FAWorld::findNearestPlayer(mActor);
 
-            int32_t dist = FAWorld::squaredDistance(nearest->getPos(), mActor->getPos());
+            int32_t dist = 0;
 
-            if (dist <= std::pow(5, 2)) // we are close enough to engage the player
+            if (nearest)
+                dist = FAWorld::squaredDistance(nearest->getPos(), mActor->getPos());
+
+            if (nearest && dist <= std::pow(5, 2)) // we are close enough to engage the player
             {
-                mActor->mTarget = nearest;
+                if (mTicksSinceLastAction >= World::getTicksInPeriod("1"))
+                {
+                    mActor->mTarget = nearest;
+                    mTicksSinceLastAction = 0;
+                }
+                else
+                {
+                    mActor->mTarget = mActor->getPos().current();
+                }
             }
             else if (dist >= std::pow(100, 2)) // just freeze if we're miles away from anyone
             {
@@ -69,7 +87,7 @@ namespace FAWorld
             {
                 if (mActor->getWorld()->mRng->randomInRange(0, 100) > 80)
                 {
-                    std::pair<int32_t, int32_t> next;
+                    Misc::Point next;
 
                     int its = 0;
                     do
@@ -77,9 +95,9 @@ namespace FAWorld
                         ++its;
                         next = mActor->getPos().current();
 
-                        next.first += mActor->getWorld()->mRng->randomInRange(-5, 5);
-                        next.second += mActor->getWorld()->mRng->randomInRange(-5, 5);
-                    } while (its < 10 && (!mActor->getLevel()->isPassable(next.first, next.second) || next == mActor->getPos().current()));
+                        next.x += mActor->getWorld()->mRng->randomInRange(-5, 5);
+                        next.y += mActor->getWorld()->mRng->randomInRange(-5, 5);
+                    } while (its < 10 && (!mActor->getLevel()->isPassable(next, mActor) || next == mActor->getPos().current()));
 
                     static int no = 0;
                     static int yes = 0;

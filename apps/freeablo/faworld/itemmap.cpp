@@ -1,49 +1,49 @@
 #include "itemmap.h"
-
-#include "item.h"
-
 #include "../engine/threadmanager.h"
 #include "../farender/animationplayer.h"
-#include "../fasavegame/gameloader.h"
 #include "gamelevel.h"
+#include "item/itembase.h"
 #include "world.h"
+#include <engine/enginemain.h>
+#include <memory>
+#include <render/spritegroup.h>
 
 namespace FAWorld
 {
-    Tile::Tile(FASaveGame::GameLoader& loader) : x(loader.load<int32_t>()), y(loader.load<int32_t>()) {}
-
-    void Tile::save(FASaveGame::GameSaver& saver) const
-    {
-        saver.save(x);
-        saver.save(y);
-    }
-
-    PlacedItemData::PlacedItemData(std::unique_ptr<Item> itemArg, const Tile& tile)
+    PlacedItemData::PlacedItemData(std::unique_ptr<Item>&& itemArg, Misc::Point tile)
         : mItem(std::move(itemArg)), mAnimation(new FARender::AnimationPlayer()), mTile(tile)
     {
-        mAnimation->playAnimation(mItem->getFlipSpriteGroup(), World::getTicksInPeriod("0.05"), FARender::AnimationPlayer::AnimationType::FreezeAtEnd);
+        mAnimation->playAnimation(mItem->getBase()->mDropItemAnimation, World::getTicksInPeriod("0.05"), FARender::AnimationPlayer::AnimationType::FreezeAtEnd);
     }
 
     PlacedItemData::PlacedItemData(FASaveGame::GameLoader& loader)
     {
-        mItem.reset(new Item());
-        mItem->load(loader);
-        mAnimation.reset(new FARender::AnimationPlayer(loader));
-        mTile = Tile(loader);
+        mItem = Engine::EngineMain::get()->mWorld->getItemFactory().loadItem(loader);
+        mAnimation = std::make_unique<FARender::AnimationPlayer>();
+        mAnimation->load(loader);
+        mTile = Misc::Point(loader);
+
+        restoreSprites();
     }
 
     void PlacedItemData::save(FASaveGame::GameSaver& saver) const
     {
-        mItem->save(saver);
+        Engine::EngineMain::get()->mWorld->getItemFactory().saveItem(*mItem, saver);
         mAnimation->save(saver);
         mTile.save(saver);
     }
 
     void PlacedItemData::update() { mAnimation->update(); }
 
-    std::pair<FARender::FASpriteGroup*, int32_t> PlacedItemData::getSpriteFrame() { return mAnimation->getCurrentFrame(); }
+    std::pair<Render::SpriteGroup*, int32_t> PlacedItemData::getSpriteFrame() { return mAnimation->getCurrentFrame(); }
 
-    bool PlacedItemData::onGround() { return mAnimation->getCurrentFrame().second == mItem->getFlipSpriteGroup()->getAnimLength() - 1; }
+    bool PlacedItemData::onGround() { return mAnimation->getCurrentFrame().second == mItem->getBase()->mDropItemAnimation->getAnimationLength() - 1; }
+
+    void PlacedItemData::restoreSprites()
+    {
+        mAnimation->replaceAnimation(mItem->getBase()->mDropItemAnimation);
+        mAnimation->animationRestoredAfterSave = true;
+    }
 
     ItemMap::ItemMap(const GameLevel* level) : mWidth(level->width()), mHeight(level->height()), mLevel(level) {}
 
@@ -52,12 +52,12 @@ namespace FAWorld
         uint32_t itemsSize = loader.load<uint32_t>();
         for (uint32_t i = 0; i < itemsSize; i++)
         {
-            Tile key(loader);
+            Misc::Point key(loader);
             mItems.emplace(key, PlacedItemData(loader));
         }
     }
 
-    void ItemMap::save(FASaveGame::GameSaver& saver)
+    void ItemMap::save(FASaveGame::GameSaver& saver) const
     {
         uint32_t itemsSize = uint32_t(mItems.size());
         saver.save(itemsSize);
@@ -70,23 +70,23 @@ namespace FAWorld
 
     ItemMap::~ItemMap() {}
 
-    bool ItemMap::dropItem(std::unique_ptr<Item>&& item, const Actor& actor, const Tile& tile)
+    bool ItemMap::dropItem(std::unique_ptr<Item>& item, const Actor& actor, Misc::Point tile)
     {
-        if (!mLevel->isPassableFor(tile.x, tile.y, &actor))
+        if (!mLevel->isPassable(tile, &actor))
             return false;
 
         auto it = mItems.find(tile);
         if (it != mItems.end())
             return false;
 
-        Engine::ThreadManager::get()->playSound(item->getFlipSoundPath());
+        Engine::ThreadManager::get()->playSound(item->getBase()->mDropItemSoundPath);
         mItems.emplace(tile, PlacedItemData{std::move(item), tile});
         return true;
     }
 
-    PlacedItemData* ItemMap::getItemAt(const Tile& tile)
+    PlacedItemData* ItemMap::getItemAt(Misc::Point pos)
     {
-        auto it = mItems.find({tile.x, tile.y});
+        auto it = mItems.find(pos);
         if (it == mItems.end())
             return nullptr;
 
@@ -96,13 +96,16 @@ namespace FAWorld
         return &it->second;
     }
 
-    std::unique_ptr<Item> ItemMap::takeItemAt(const Tile& tile)
+    std::unique_ptr<Item> ItemMap::takeItemAt(Misc::Point tile)
     {
-        auto it = mItems.find({tile.x, tile.y});
+        auto it = mItems.find(tile);
         if (it == mItems.end())
             return nullptr;
 
-        auto item = std::move(it->second.mItem);
+        if (!it->second.onGround())
+            return nullptr;
+
+        std::unique_ptr<Item> item = std::move(it->second.mItem);
         mItems.erase(it);
         return item;
     }

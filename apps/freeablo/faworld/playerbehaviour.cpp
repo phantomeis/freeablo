@@ -2,9 +2,15 @@
 #include "../fagui/guimanager.h"
 #include "../farender/renderer.h"
 #include "equiptarget.h"
+#include "fasavegame/gameloader.h"
 #include "input/inputmanager.h"
+#include "item/itembase.h"
+#include "item/usableitem.h"
 #include "player.h"
+#include "potion.h"
 #include "storedata.h"
+#include <algorithm>
+#include <engine/threadmanager.h>
 #include <misc/assert.h>
 
 namespace FAWorld
@@ -15,6 +21,22 @@ namespace FAWorld
     {
         release_assert(actor->getTypeId() == Player::typeId);
         mPlayer = static_cast<Player*>(actor);
+    }
+
+    PlayerBehaviour::PlayerBehaviour(FASaveGame::GameLoader& loader)
+    {
+        mActiveSpell = (SpellId)loader.load<int32_t>();
+
+        for (auto& hotkey : mSpellHotkey)
+            hotkey = (SpellId)loader.load<int32_t>();
+    }
+
+    void PlayerBehaviour::save(FASaveGame::GameSaver& saver) const
+    {
+        saver.save((int32_t)mActiveSpell);
+
+        for (auto& hotkey : mSpellHotkey)
+            saver.save((int32_t)hotkey);
     }
 
     void PlayerBehaviour::reAttach(Actor* actor)
@@ -50,25 +72,33 @@ namespace FAWorld
         {
             case PlayerInput::Type::TargetTile:
             {
-                auto clickedTile = Render::Tile(input.mData.dataTargetTile.x, input.mData.dataTargetTile.y);
-                mPlayer->getLevel()->activate(clickedTile.x, clickedTile.y);
+                auto clickedPoint = Misc::Point(input.mData.dataTargetTile.x, input.mData.dataTargetTile.y);
 
-                auto cursorItem = mPlayer->mInventory.getItemAt(MakeEquipTarget<EquipTargetType::cursor>());
-                if (!cursorItem.isEmpty())
+                if (mPlayer->getLevel()->isDoor(clickedPoint))
                 {
-                    mPlayer->dropItem({clickedTile.x, clickedTile.y});
+                    mPlayer->mTarget = clickedPoint;
+                    return;
+                }
+
+                const Item* cursorItem = mPlayer->mInventory.getCursorHeld();
+                if (cursorItem)
+                {
+                    mPlayer->dropItem(clickedPoint);
                 }
                 else
                 {
                     mPlayer->mTarget.clear();
-                    mPlayer->mMoveHandler.setDestination({clickedTile.x, clickedTile.y});
+                    mPlayer->mMoveHandler.setDestination(clickedPoint);
                 }
                 return;
             }
             case PlayerInput::Type::DragOverTile:
             {
-                mPlayer->mTarget.clear();
-                mPlayer->mMoveHandler.setDestination({input.mData.dataDragOverTile.x, input.mData.dataDragOverTile.y});
+                if (!mPlayer->isAttacking && (input.mData.dataDragOverTile.isStart || !mPlayer->hasTarget()))
+                {
+                    mPlayer->mTarget.clear();
+                    mPlayer->mMoveHandler.setDestination({input.mData.dataDragOverTile.x, input.mData.dataDragOverTile.y});
+                }
                 return;
             }
             case PlayerInput::Type::TargetActor:
@@ -78,14 +108,19 @@ namespace FAWorld
             }
             case PlayerInput::Type::TargetItemOnFloor:
             {
-                auto item = mPlayer->getLevel()->getItemMap().getItemAt({input.mData.dataTargetItemOnFloor.x, input.mData.dataTargetItemOnFloor.y});
-                mPlayer->mTarget = Target::ItemTarget{input.mData.dataTargetItemOnFloor.type, item};
+                mPlayer->mTarget = Target::ItemTarget{input.mData.dataTargetItemOnFloor.type, input.mData.dataTargetItemOnFloor.position};
                 return;
             }
-            case PlayerInput::Type::AttackDirection:
+            case PlayerInput::Type::ForceAttack:
             {
                 if (!mPlayer->getLevel()->isTown())
-                    mPlayer->startMeleeAttack(input.mData.dataAttackDirection.direction);
+                    mPlayer->forceAttack(input.mData.dataForceAttack.pos);
+                return;
+            }
+            case PlayerInput::Type::CastSpell:
+            {
+                auto clickedPoint = Misc::Point(input.mData.dataCastSpell.x, input.mData.dataCastSpell.y);
+                mPlayer->castSpell(mActiveSpell, clickedPoint);
                 return;
             }
             case PlayerInput::Type::ChangeLevel:
@@ -96,15 +131,8 @@ namespace FAWorld
                 else
                     nextLevelIndex = mPlayer->getLevel()->getNextLevel();
 
-                GameLevel* level = mPlayer->getWorld()->getLevel(nextLevelIndex);
-
-                if (level)
-                {
-                    if (input.mData.dataChangeLevel.direction == PlayerInput::ChangeLevelData::Direction::Up)
-                        mPlayer->teleport(level, Position(level->downStairsPos().first, level->downStairsPos().second));
-                    else
-                        mPlayer->teleport(level, Position(level->upStairsPos().first, level->upStairsPos().second));
-                }
+                if (GameLevel* level = mPlayer->getWorld()->getLevel(nextLevelIndex))
+                    mPlayer->moveToLevel(level, input.mData.dataChangeLevel.direction == PlayerInput::ChangeLevelData::Direction::Down);
 
                 return;
             }
@@ -121,24 +149,73 @@ namespace FAWorld
                                                         mPlayer->getWorld()->getItemFactory());
                 return;
             }
+            case PlayerInput::Type::SetActiveSpell:
+            {
+                mActiveSpell = input.mData.dataSetActiveSpell.spell;
+                return;
+            }
+            case PlayerInput::Type::ConfigureSpellHotkey:
+            {
+                for (auto& hk : mSpellHotkey)
+                {
+                    if (hk == input.mData.dataConfigureSpellHotkey.spell)
+                        hk = SpellId::null;
+                }
+                mSpellHotkey[input.mData.dataConfigureSpellHotkey.hotkey] = input.mData.dataConfigureSpellHotkey.spell;
+                return;
+            }
+            case PlayerInput::Type::SpellHotkey:
+            {
+                mActiveSpell = mSpellHotkey[input.mData.dataSpellHotkey.hotkey];
+                return;
+            }
             case PlayerInput::Type::BuyItem:
             {
-                auto items = mPlayer->getWorld()->getStoreData().griswoldBasicItems;
+                auto& items = mPlayer->getWorld()->getStoreData().griswoldBasicItems;
                 auto item = std::find_if(items.begin(), items.end(), [&](StoreItem& item) { return item.storeId == input.mData.dataBuyItem.itemId; });
 
                 if (item == items.end())
                     return;
 
-                int32_t price = item->item.getPrice();
+                int32_t price = item->item->getPrice();
                 if (mPlayer->mInventory.getTotalGold() < price)
                     return;
 
-                if (!mPlayer->mInventory.getInv(FAWorld::EquipTargetType::inventory).canFitItem(item->item))
+                if (!mPlayer->mInventory.getInv(FAWorld::EquipTargetType::inventory).canFitItem(*item->item))
                     return;
 
                 mPlayer->mInventory.takeOutGold(price);
                 mPlayer->mInventory.autoPlaceItem(item->item);
                 items.erase(item);
+
+                return;
+            }
+            case PlayerInput::Type::SellItem:
+            {
+                int32_t price = 0;
+                {
+                    const Item* item = mPlayer->mInventory.getItemAt(input.mData.dataSellItem.itemLocation);
+
+                    // TODO: validate sell filter here
+                    if (!item || item->getBase()->mType == ItemType::gold)
+                        return;
+
+                    price = item->getPrice();
+                }
+
+                release_assert(mPlayer->mInventory.remove(input.mData.dataSellItem.itemLocation));
+                mPlayer->mInventory.placeGold(price, mPlayer->getWorld()->getItemFactory());
+
+                return;
+            }
+            case PlayerInput::Type::UseItem:
+            {
+                if (mPlayer->mInventory.getItemAt(input.mData.dataUseItem.target) &&
+                    mPlayer->mInventory.getItemAt(input.mData.dataUseItem.target)->getAsUsableItem())
+                {
+                    std::unique_ptr<Item> item = mPlayer->mInventory.remove(input.mData.dataUseItem.target);
+                    item->getAsUsableItem()->applyEffect(*mPlayer);
+                }
 
                 return;
             }

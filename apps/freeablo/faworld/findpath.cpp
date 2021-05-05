@@ -1,6 +1,19 @@
 #include "findpath.h"
 #include "gamelevel.h"
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <misc/array2d.h>
 #include <misc/stdhashes.h>
+#include <queue>
+
+namespace
+{
+    const int STRAIGHT_WEIGHT = 10;
+    const int DIAGONAL_WEIGHT = 14;
+
+    int distanceCost(const Misc::Point& a, const Misc::Point& b) { return (a.x != b.x && a.y != b.y) ? DIAGONAL_WEIGHT : STRAIGHT_WEIGHT; }
+}
 
 namespace FAWorld
 {
@@ -21,102 +34,89 @@ namespace FAWorld
         }
     };
 
-    typedef std::pair<int32_t, int32_t> Location;
-
-    bool inBounds(GameLevelImpl* level, Location location)
+    bool inBounds(GameLevelImpl* level, Misc::Point location)
     {
-        int x = location.first;
-        int y = location.second;
+        int x = location.x;
+        int y = location.y;
         return 0 <= x && x < (int)level->width() && 0 <= y && y < (int)level->height();
     }
 
-    std::vector<Location> neighbors(GameLevelImpl* level, Location location)
+    Misc::Points neighbors(GameLevelImpl* level, const Actor* actor, const Misc::Point& location)
     {
-        int x = location.first;
-        int y = location.second;
+        int x = location.x;
+        int y = location.y;
 
-        std::vector<Location> results(0);
-        results.reserve(9);
+        Misc::Points result;
+        result.reserve(9);
 
         for (int32_t dy = -1; dy <= 1; dy++)
         {
             for (int32_t dx = -1; dx <= 1; dx++)
             {
-                Location next(x + dx, y + dy);
-                if (inBounds(level, next) && level->isPassable(next.first, next.second))
-                    results.push_back(next);
+                Misc::Point next(x + dx, y + dy);
+                if (inBounds(level, next) && level->isPassable(next, actor))
+                    result.push_back(next);
             }
         }
 
-        return results;
+        return result;
     }
 
-    int heuristic(Location a, Location b)
+    size_t heuristic(Misc::Point a, Misc::Point b)
     {
-        int dx = abs(b.first - a.first);
-        int dy = abs(b.second - a.second);
+        auto dx = abs(b.x - a.x);
+        auto dy = abs(b.y - a.y);
 
-        return dx + dy;
+        auto straight = std::abs(dx - dy);
+        auto diagonal = std::max(dx, dy) - straight;
+
+        return straight * STRAIGHT_WEIGHT + diagonal * DIAGONAL_WEIGHT;
     }
 
-    template <typename T> class Array2D
+    bool AStarSearch(GameLevelImpl* level,
+                     const Actor* actor,
+                     Misc::Point start,
+                     Misc::Point& goal,
+                     std::unordered_map<Misc::Point, Misc::Point>& came_from,
+                     bool findAdjacent)
     {
-    public:
-        Array2D(int32_t width, int32_t height) : mData(width * height), mWidth(width), mHeight(height) {}
-
-        Array2D(int32_t width, int32_t height, T defaultVal) : mData(width * height, defaultVal), mWidth(width), mHeight(height) {}
-
-        T& get(int32_t x, int32_t y) { return mData.at(x + y * mHeight); }
-
-        int32_t width() { return mWidth; }
-
-        int32_t height() { return mHeight; }
-
-    private:
-        std::vector<T> mData;
-        int32_t mWidth;
-        int32_t mHeight;
-    };
-
-    bool AStarSearch(GameLevelImpl* level, Location start, Location& goal, std::unordered_map<Location, Location>& came_from, bool findAdjacent)
-    {
-        auto goalPassable = level->isPassable(goal.first, goal.second);
-        PriorityQueue<Location> frontier;
+        auto goalPassable = level->isPassable(goal, actor);
+        PriorityQueue<Misc::Point> frontier;
         frontier.put(start, 0);
         came_from[start] = start;
 
-        Array2D<int32_t> costSoFar(level->width(), level->height(), -1);
-        costSoFar.get(start.first, start.second) = 0;
+        static Misc::Array2D<int32_t> costSoFar;
+        costSoFar.resize(level->width(), level->height());
+        memset(costSoFar.data(), 0xff, level->width() * level->height() * sizeof(int32_t));
+
+        costSoFar.get(start.x, start.y) = 0;
 
         int32_t iterations = 0;
-        while (!frontier.empty() && iterations < 500)
+        while (!frontier.empty() && iterations < 1000)
         {
             iterations++;
-            Location current = frontier.get();
+            Misc::Point current = frontier.get();
 
             // Early exit
             if (current == goal)
                 return true;
             if (findAdjacent || !goalPassable)
             {
-                if (abs(goal.first - current.first) <= 1 && abs(goal.second - current.second) <= 1)
+                if (abs(goal.x - current.x) <= 1 && abs(goal.y - current.y) <= 1)
                 {
                     goal = current;
                     return true;
                 }
             }
 
-            std::vector<Location> neighborsContainer = neighbors(level, current);
-            for (std::vector<Location>::iterator it = neighborsContainer.begin(); it != neighborsContainer.end(); it++)
+            for (const auto& next : neighbors(level, actor, current))
             {
-                int32_t new_cost = costSoFar.get(current.first, current.second) + 1; // graph.cost(current, next);
-                Location next = *it;
+                auto new_cost = costSoFar.get(current.x, current.y) + distanceCost(current, next);
 
-                if (costSoFar.get(next.first, next.second) == -1 || new_cost < costSoFar.get(next.first, next.second))
+                if (costSoFar.get(next.x, next.y) == -1 || new_cost < costSoFar.get(next.x, next.y))
                 {
-                    costSoFar.get(next.first, next.second) = new_cost;
-                    int32_t priority = new_cost + heuristic(next, goal);
-                    frontier.put(next, priority);
+                    costSoFar.get(next.x, next.y) = new_cost;
+                    frontier.put(next, new_cost + heuristic(next, goal));
                     came_from[next] = current;
                 }
             }
@@ -125,10 +125,10 @@ namespace FAWorld
         return false;
     }
 
-    std::vector<Location> reconstructPath(Location start, Location goal, std::unordered_map<Location, Location>& cameFrom)
+    Misc::Points reconstructPath(Misc::Point start, Misc::Point goal, std::unordered_map<Misc::Point, Misc::Point>& cameFrom)
     {
-        std::vector<Location> path;
-        Location current = goal;
+        Misc::Points path;
+        Misc::Point current = goal;
         path.push_back(current);
         while (current != start)
         {
@@ -136,43 +136,20 @@ namespace FAWorld
             if (current != start)
                 path.push_back(current);
         }
+        path.push_back(start);
         std::reverse(path.begin(), path.end());
         return path;
     }
 
-    Location findClosesPointToGoal(GameLevelImpl* level, Location start, Location goal, std::unordered_map<Location, Location>& cameFrom)
+    Misc::Points pathFind(GameLevelImpl* level, const Actor* actor, const Misc::Point& start, const Misc::Point& goal, bool& bArrivable, bool findAdjacent)
     {
-        // int dx = abs(goal.first - start.first);
-        // int dy = abs(goal.second - start.second);
-        UNUSED_PARAM(start);
-        int minDistance = level->width() * level->width() + level->height() * level->height();
+        auto adjustedGoal = goal;
+        std::unordered_map<Misc::Point, Misc::Point> cameFrom;
 
-        Location result(-1, -1);
-
-        for (std::unordered_map<Location, Location>::iterator it = cameFrom.begin(); it != cameFrom.end(); it++)
-        {
-            int tmpX = abs(it->first.first - goal.first);
-            int tmpY = abs(it->first.second - goal.second);
-
-            int distance = tmpX * tmpX + tmpY * tmpY;
-            if (distance < minDistance)
-            {
-                minDistance = distance;
-                result = it->first;
-            }
-        }
-
-        return result;
-    }
-
-    std::vector<Location> pathFind(GameLevelImpl* level, Location start, Location& goal, bool& bArrivable, bool findAdjacent)
-    {
-        std::unordered_map<Location, Location> cameFrom;
-
-        bArrivable = AStarSearch(level, start, goal, cameFrom, findAdjacent);
+        bArrivable = AStarSearch(level, actor, start, adjustedGoal, cameFrom, findAdjacent);
         if (!bArrivable)
             return {};
 
-        return reconstructPath(start, goal, cameFrom);
+        return reconstructPath(start, adjustedGoal, cameFrom);
     }
 }

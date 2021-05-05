@@ -8,6 +8,8 @@
 #include "../nkhelpers.h"
 #include "diabloexe/characterstats.h"
 #include "startingmenuscreen.h"
+#include <memory>
+#include <render/spritegroup.h>
 
 namespace FAGui
 {
@@ -25,14 +27,10 @@ namespace FAGui
     {
         auto renderer = FARender::Renderer::get();
         mSmLogo = menu.createSmLogo();
-        mFocus.reset(new FARender::AnimationPlayer());
-        mFocus->playAnimation(renderer->loadImage("ui_art/focus.pcx&trans=0,255,0&vanim=30"),
+        mFocus = std::make_unique<FARender::AnimationPlayer>();
+        mFocus->playAnimation(renderer->mSpriteLoader.getSprite(renderer->mSpriteLoader.mGuiSprites.mediumPentagramSpin),
                               FAWorld::World::getTicksInPeriod("0.06"),
                               FARender::AnimationPlayer::AnimationType::Looped);
-        mFocus16.reset(new FARender::AnimationPlayer());
-        mFocus16->playAnimation(renderer->loadImage("ui_art/focus16.pcx&trans=0,255,0&vanim=20"),
-                                FAWorld::World::getTicksInPeriod("0.06"),
-                                FARender::AnimationPlayer::AnimationType::Looped);
         setType(ContentType::chooseClass);
     }
 
@@ -66,9 +64,34 @@ namespace FAGui
                     ret = DrawFunctionResult::setActive;
                 if (nk_widget_is_mouse_click_down_inactive(ctx, NK_BUTTON_DOUBLE))
                     ret = DrawFunctionResult::executeAction;
+
                 if (isActive)
                 {
-                    mSelectedCharacterInfo = characterInfo{type, mMenuHandler.engine().exe().getCharacterStat(text)};
+                    if (type != FAWorld::PlayerClass::none)
+                    {
+                        std::string classLookup;
+                        switch (type)
+                        {
+                            case FAWorld::PlayerClass::warrior:
+                                classLookup = "Warrior";
+                                break;
+                            case FAWorld::PlayerClass::rogue:
+                                classLookup = "Rogue";
+                                break;
+                            case FAWorld::PlayerClass::sorceror:
+                                classLookup = "Sorceror";
+                                break;
+                            case FAWorld::PlayerClass::none:
+                                break;
+                        }
+
+                        mSelectedCharacterInfo = characterInfo{type, mMenuHandler.engine().exe().getCharacterStat(classLookup)};
+                    }
+                    else
+                    {
+                        mSelectedCharacterInfo = std::nullopt;
+                    }
+
                     auto frame = mFocus->getCurrentFrame();
                     auto frameRect = nk_rect(0, 0, frame.first->getWidth(), frame.first->getHeight());
                     nk_layout_space_push(ctx, alignRect(frameRect, rect, halign_t::left, valign_t::center));
@@ -76,22 +99,34 @@ namespace FAGui
                     nk_layout_space_push(ctx, alignRect(frameRect, rect, halign_t::right, valign_t::center));
                     nk_image(ctx, frame.first->getNkImage(frame.second));
                 }
+
                 return ret;
             };
         };
         mMenuItems.clear();
         mMenuItems.push_back({drawItem("Warrior", {262, 278, 320, 33}, FAWorld::PlayerClass::warrior), [&]() {
-                                  mMenuHandler.engine().startGame("Warrior");
+                                  mMenuHandler.engine().startGame(FAWorld::PlayerClass::warrior);
                                   return ActionResult::stopDrawing;
                               }});
         mMenuItems.push_back({drawItem("Rogue", {262, 311, 320, 33}, FAWorld::PlayerClass::rogue), [&]() {
-                                  mMenuHandler.engine().startGame("Rogue");
+                                  mMenuHandler.engine().startGame(FAWorld::PlayerClass::rogue);
                                   return ActionResult::stopDrawing;
                               }});
-        mMenuItems.push_back({drawItem("Sorcerer", {262, 344, 320, 33}, FAWorld::PlayerClass::sorcerer), [&]() {
-                                  mMenuHandler.engine().startGame("Sorcerer");
+        mMenuItems.push_back({drawItem("Sorceror", {262, 344, 320, 33}, FAWorld::PlayerClass::sorceror), [&]() {
+                                  mMenuHandler.engine().startGame(FAWorld::PlayerClass::sorceror);
                                   return ActionResult::stopDrawing;
                               }});
+
+        // TODO: this is hacky, we should recreate the original character select gui
+        FILE* saveFile = fopen("save.sav", "rb");
+        if (saveFile)
+        {
+            fclose(saveFile);
+            mMenuItems.push_back({drawItem("Load Game", {262, 377, 320, 33}, FAWorld::PlayerClass::none), [&]() {
+                                      mMenuHandler.engine().startGameFromSave("save.sav");
+                                      return ActionResult::stopDrawing;
+                                  }});
+        }
     }
 
     void SelectHeroMenuScreen::setType(ContentType type)
@@ -162,8 +197,8 @@ namespace FAGui
         nk_layout_space_push(ctx, {26, 207, 180, 76});
         {
             auto renderer = FARender::Renderer::get();
-            auto heros_img =
-                renderer->loadImage("ui_art/heros.pcx&vanim=76")->getNkImage(mSelectedCharacterInfo ? static_cast<int>(mSelectedCharacterInfo->charClass) : 3);
+            auto heros_img = renderer->mSpriteLoader.getSprite(renderer->mSpriteLoader.mGuiSprites.characterSelectPortraits)
+                                 ->getNkImage(mSelectedCharacterInfo ? static_cast<int>(mSelectedCharacterInfo->charClass) : 3);
             nk_image(ctx, heros_img);
         }
         nk_layout_space_end(ctx);
@@ -171,14 +206,15 @@ namespace FAGui
 
     void SelectHeroMenuScreen::update(nk_context* ctx)
     {
-        for (auto ptr : {mSmLogo.get(), mFocus.get(), mFocus16.get()})
-            ptr->update();
+        for (auto& animation : {mSmLogo.get(), mFocus.get()})
+            animation->update();
+
         Misc::ScopedSetter<float> setter(ctx->style.window.border, 0);
         auto renderer = FARender::Renderer::get();
         int32_t screenW, screenH;
         renderer->getWindowDimensions(screenW, screenH);
-        auto bg = renderer->loadImage("ui_art/selhero.pcx")->getNkImage();
-        nk_style_push_style_item(ctx, &ctx->style.window.fixed_background, nk_style_item_image(bg));
+        struct nk_image background = renderer->mSpriteLoader.getSprite(renderer->mSpriteLoader.mGuiSprites.characterSelectBackground)->getNkImage();
+        nk_style_push_style_item(ctx, &ctx->style.window.fixed_background, nk_style_item_image(background));
         if (nk_begin(
                 ctx,
                 "selectHeroScreen",

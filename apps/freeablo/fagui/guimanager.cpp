@@ -1,27 +1,34 @@
 #include "guimanager.h"
 #include "../engine/enginemain.h"
 #include "../engine/localinputhandler.h"
+#include "../engine/threadmanager.h"
 #include "../farender/renderer.h"
 #include "../fasavegame/gameloader.h"
 #include "../faworld/actorstats.h"
 #include "../faworld/equiptarget.h"
-#include "../faworld/itemenums.h"
 #include "../faworld/player.h"
+#include "../faworld/playerbehaviour.h"
+#include "../faworld/spells.h"
 #include "../faworld/world.h"
-#include "boost/range/counting_range.hpp"
 #include "dialogmanager.h"
 #include "fa_nuklear.h"
+#include "menu/multiplayerconnecting.h"
 #include "menu/pausemenuscreen.h"
 #include "menu/startingmenuscreen.h"
 #include "menuhandler.h"
 #include "nkhelpers.h"
-#include <boost/algorithm/string/split.hpp>
-#include <boost/variant/variant.hpp>
 #include <cstdint>
 #include <cstdio>
+#include <faworld/item/equipmentitem.h>
+#include <faworld/item/equipmentitembase.h>
+#include <faworld/item/golditem.h>
+#include <fmt/format.h>
 #include <iostream>
 #include <memory>
 #include <misc/misc.h>
+#include <misc/stringops.h>
+#include <random/random.h>
+#include <render/spritegroup.h>
 #include <serial/textstream.h>
 #include <string>
 
@@ -54,22 +61,23 @@ namespace FAGui
         return PanelPlacement::none;
     }
 
-    const char* bgImgPath(PanelType type)
+    const FARender::SpriteLoader::SpriteDefinition& getBackgroundForPanel(PanelType type)
     {
         switch (type)
         {
             case PanelType::none:
-                break;
+                invalid_enum(PanelType, type);
             case PanelType::inventory:
-                return "data/inv/inv.cel";
+                return FARender::Renderer::get()->mSpriteLoader.mGuiSprites.inventoryBackground;
             case PanelType::spells:
-                return "data/spellbk.cel";
+                return FARender::Renderer::get()->mSpriteLoader.mGuiSprites.spellsBackground;
             case PanelType::character:
-                return "data/char.cel";
+                return FARender::Renderer::get()->mSpriteLoader.mGuiSprites.characterBackground;
             case PanelType::quests:
-                return "data/quest.cel";
+                return FARender::Renderer::get()->mSpriteLoader.mGuiSprites.questsBackground;
         }
-        return nullptr;
+
+        invalid_enum(PanelType, type);
     }
 
     const char* panelName(PanelType type)
@@ -90,19 +98,20 @@ namespace FAGui
         return "";
     }
 
-    GuiManager::GuiManager(Engine::EngineMain& engine) : mDialogManager(*this, *engine.mWorld.get()), mEngine(engine)
+    GuiManager::GuiManager(Engine::EngineMain& engine) : mDialogManager(*this, *engine.mWorld), mEngine(engine)
     {
-        mMenuHandler.reset(new MenuHandler(engine));
+        mMenuHandler = std::make_unique<MenuHandler>(engine);
 
         auto renderer = FARender::Renderer::get();
-        mSmallPentagram.reset(new FARender::AnimationPlayer());
-        mSmallPentagram->playAnimation(
-            renderer->loadImage("data/pentspn2.cel"), FAWorld::World::getTicksInPeriod("0.06"), FARender::AnimationPlayer::AnimationType::Looped);
+        mSmallPentagram = std::make_unique<FARender::AnimationPlayer>();
+        mSmallPentagram->playAnimation(renderer->mSpriteLoader.getSprite(renderer->mSpriteLoader.mGuiSprites.smallPentagramSpin),
+                                       FAWorld::World::getTicksInPeriod("0.06"),
+                                       FARender::AnimationPlayer::AnimationType::Looped);
 
         startingScreen();
     }
 
-    GuiManager::~GuiManager() {}
+    GuiManager::~GuiManager() = default;
 
     void
     GuiManager::nk_fa_begin_window(nk_context* ctx, const char* title, struct nk_rect bounds, nk_flags flags, std::function<void(void)> action, bool isModal)
@@ -128,203 +137,22 @@ namespace FAGui
         nk_style_pop_style_item(ctx);
     }
 
-    namespace
-    {
-        struct applyEffect
-        {
-            applyEffect(nk_context* ctx, EffectType type) : mCtx(ctx) { nk_set_user_data(mCtx, nk_handle_id(static_cast<int>(type))); }
-            ~applyEffect() { nk_set_user_data(mCtx, nk_handle_id(static_cast<int>(EffectType::none))); }
-
-            nk_context* mCtx;
-        };
-    }
-
-    void GuiManager::dialog(nk_context* ctx)
-    {
-        // This part is needed because dialog is triggered by mouse click
-        // and if nuklear gui will appear on the same frame as click happens -
-        // nuklear will treat dialog-triggering click as click on its window
-        // thus incorrectly triggering dialog action if your cursor is on it.
-        // This workaround seems to fully mitigate it.
-        if (mSkipDialogFrame)
-        {
-            mSkipDialogFrame = false;
-            return;
-        }
-
-        if (mDialogs.empty())
-            return;
-
-        if (mCurRightPanel != PanelType::none)
-            togglePanel(mCurRightPanel);
-        if (mCurLeftPanel != PanelType::none)
-            togglePanel(mCurLeftPanel);
-
-        auto& activeDialog = mDialogs.back();
-
-        auto renderer = FARender::Renderer::get();
-        auto boxTex = renderer->loadImage(activeDialog.mIsWide ? "data/textbox.cel" : "data/textbox2.cel");
-        nk_flags flags = NK_WINDOW_NO_SCROLLBAR;
-        int32_t screenW, screenH;
-        renderer->getWindowDimensions(screenW, screenH);
-        nk_fa_begin_image_window(
-            ctx,
-            "dialog",
-            nk_rect(screenW / 2. - (activeDialog.mIsWide ? boxTex->getWidth() / 2 : 0.0),
-                    screenH - boxTex->getHeight() - 153,
-                    boxTex->getWidth(),
-                    boxTex->getHeight()),
-            flags,
-            boxTex->getNkImage(),
-            [&]() {
-                nk_layout_space_begin(ctx, NK_STATIC, 0, INT_MAX);
-                auto cbRect = nk_rect(3, 3, boxTex->getWidth() - 6, boxTex->getHeight() - 6);
-                nk_layout_space_push(ctx, cbRect);
-                auto blackTex = renderer->loadImage("resources/black.png");
-                {
-                    applyEffect effect(ctx, EffectType::checkerboarded);
-                    nk_image(ctx, nk_subimage_handle(blackTex->getNkImage().handle, blackTex->getWidth(), blackTex->getHeight(), cbRect));
-                }
-
-                int startY = 5;
-                constexpr int textRowHeight = 12;
-                int rowNum = 0;
-                constexpr int sliderStartLine = 4, sliderEndLine = 20;
-
-                auto drawLine = [&](const DialogLineData& line, int lineIndex) {
-                    auto lineRect = nk_rect(3, 3 + startY + rowNum * textRowHeight + line.mYOffset, boxTex->getWidth() - 6, textRowHeight);
-
-                    if (activeDialog.isScrollbarShown())
-                    {
-                        auto sliderImg = renderer->loadImage("data/textslid.cel");
-                        auto arrowRect = nk_rect(0, 0, sliderImg->getWidth(), sliderImg->getHeight());
-                        if (rowNum >= sliderStartLine && rowNum <= sliderEndLine)
-                        {
-                            nk_layout_space_push(ctx, alignRect(arrowRect, lineRect, halign_t::right, valign_t::center));
-                            if (rowNum == sliderStartLine)
-                            {
-                                nk_button_label_styled(ctx, &dummyStyle, "");
-                                nk_image(ctx, sliderImg->getNkImage(nk_widget_has_mouse_click_down(ctx, NK_BUTTON_LEFT, true) ? 11 : 9)); // up arrow
-                                if (nk_widget_is_mouse_click_down_inactive(ctx, NK_BUTTON_LEFT))
-                                    activeDialog.notify(Engine::KeyboardInputAction::prevOption, *this);
-                            }
-                            else if (rowNum == sliderEndLine)
-                            {
-                                nk_button_label_styled(ctx, &dummyStyle, "");
-                                nk_image(ctx, sliderImg->getNkImage(nk_widget_has_mouse_click_down(ctx, NK_BUTTON_LEFT, true) ? 10 : 8)); // down arrow
-                                if (nk_widget_is_mouse_click_down_inactive(ctx, NK_BUTTON_LEFT))
-                                    activeDialog.notify(Engine::KeyboardInputAction::nextOption, *this);
-                            }
-                            else
-                                nk_image(ctx, sliderImg->getNkImage(13)); // grove
-                        }
-                    }
-
-                    ++rowNum;
-
-                    if (line.isSeparator)
-                    {
-                        auto separatorRect = nk_rect(3, 0, boxTex->getWidth() - 6, 3);
-                        nk_layout_space_push(ctx, alignRect(separatorRect, lineRect, halign_t::center, valign_t::center));
-                        auto separator_image = nk_subimage_handle(boxTex->getNkImage().handle, boxTex->getWidth(), boxTex->getHeight(), separatorRect);
-                        nk_image(ctx, separator_image);
-                        return false;
-                    }
-                    lineRect.x += line.mXOffset;
-                    lineRect.w -= line.mXOffset;
-                    if (!line.alignCenter)
-                    {
-                        if (activeDialog.isScrollbarShown())
-                            lineRect.w -= 20; // for scrollbar
-                        if (line.mNumber)
-                            lineRect.w -= 20; // for pentagram
-                    }
-                    nk_layout_space_push(ctx, lineRect);
-                    if (nk_widget_is_mouse_click_down_inactive(ctx, NK_BUTTON_LEFT) && line.action)
-                    {
-                        activeDialog.mSelectedLine = lineIndex;
-                        line.action();
-                        return true;
-                    }
-                    smallText(ctx, line.text.c_str(), line.color, (line.alignCenter ? NK_TEXT_ALIGN_CENTERED : NK_TEXT_ALIGN_LEFT) | NK_TEXT_ALIGN_MIDDLE);
-                    if (auto num = line.mNumber)
-                        smallText(ctx, std::to_string(*num).c_str(), line.color, NK_TEXT_ALIGN_RIGHT);
-                    if (line.forceSelected || (lineIndex != -1 && activeDialog.selectedLine() == lineIndex))
-                    {
-                        auto pent = renderer->loadImage("data/pentspn2.cel");
-                        int pentOffset = 5;
-                        auto textWidth = smallTextWidth(line.text.c_str());
-                        // left pentagram
-                        {
-                            int offset = 0;
-                            if (line.alignCenter)
-                                offset = 3 + ((boxTex->getWidth() - 6) / 2 - textWidth / 2 - pent->getWidth() - pentOffset);
-                            else
-                                offset = line.mXOffset - pent->getWidth() - pentOffset;
-                            nk_layout_space_push(ctx, nk_rect(offset, lineRect.y, pent->getWidth(), pent->getHeight()));
-                            nk_image(ctx, pent->getNkImage(mSmallPentagram->getCurrentFrame().second));
-                        }
-                        // right pentagram
-                        {
-                            int offset = boxTex->getWidth() - 6 - pent->getWidth() - pentOffset;
-                            if (activeDialog.isScrollbarShown())
-                                offset -= 20;
-                            if (line.alignCenter)
-                                offset = ((boxTex->getWidth() - 6) / 2 + textWidth / 2 + pentOffset);
-
-                            nk_layout_space_push(ctx, nk_rect(3 + offset, lineRect.y, pent->getWidth(), pent->getHeight()));
-                            nk_image(ctx, pent->getNkImage(mSmallPentagram->getCurrentFrame().second));
-                        }
-                    }
-
-                    return false;
-                };
-
-                for (auto& line : activeDialog.mHeader)
-                    if (drawLine(line, -1))
-                        return;
-                for (int i = activeDialog.mFirstVisible; i < activeDialog.mFirstVisible + activeDialog.visibleBodyLineCount(); ++i)
-                {
-                    if (i < static_cast<int>(activeDialog.mLines.size()))
-                    {
-                        if (drawLine(activeDialog.mLines[i], i))
-                            return;
-                    }
-                    else
-                        drawLine({}, i);
-                }
-                for (auto& line : activeDialog.mFooter)
-                    if (drawLine(line, -1))
-                        return;
-
-                if (activeDialog.isScrollbarShown())
-                {
-                    auto sliderImg = renderer->loadImage("data/textslid.cel");
-                    auto height = (sliderEndLine - sliderStartLine - 1) * textRowHeight - sliderImg->getHeight();
-                    auto y = startY + (sliderStartLine + 1) * textRowHeight + 3 + (activeDialog.selectedLinePercent() * height);
-                    nk_layout_space_push(ctx, nk_rect(boxTex->getWidth() - 3 - sliderImg->getWidth(), y, sliderImg->getWidth(), sliderImg->getHeight()));
-                    nk_image(ctx, sliderImg->getNkImage(12));
-                }
-
-            },
-            true);
-    }
-
     void GuiManager::updateAnimations()
     {
         for (auto& anim : {mSmallPentagram.get()})
             anim->update();
     }
 
-    template <typename Function> void GuiManager::drawPanel(nk_context* ctx, PanelType panelType, Function op)
+    void GuiManager::drawPanel(nk_context* ctx, PanelType panelType, std::function<void(void)> op)
     {
-        auto placement = panelPlacementByType(panelType);
-        bool shown = *panel(placement) == panelType;
+        PanelPlacement placement = panelPlacementByType(panelType);
+        bool shown = *getPanelAtLocation(placement) == panelType;
+
         nk_window_show(ctx, panelName(panelType), shown ? NK_SHOWN : NK_HIDDEN);
         if (!shown)
             return;
         auto renderer = FARender::Renderer::get();
-        auto invTex = renderer->loadImage(bgImgPath(panelType));
+        auto invTex = renderer->mSpriteLoader.getSprite(getBackgroundForPanel(panelType));
         int32_t screenW, screenH;
         renderer->getWindowDimensions(screenW, screenH);
         struct nk_rect dims = nk_rect(
@@ -341,7 +169,7 @@ namespace FAGui
                 }
                 return 0;
             }(),
-            screenH - 125 - invTex->getHeight(),
+            (screenH - 125 - invTex->getHeight()) / 2,
             invTex->getWidth(),
             invTex->getHeight());
         nk_flags flags = NK_WINDOW_NO_SCROLLBAR | NK_WINDOW_BACKGROUND;
@@ -351,81 +179,63 @@ namespace FAGui
 
     void GuiManager::triggerItem(const FAWorld::EquipTarget& target)
     {
-        auto& item = mPlayer->mInventory.getItemAt(target);
-        if (!item.isUsable())
-            return;
-
-        mGoldSplitTarget = nullptr;
-
-        switch (item.getType())
+        const FAWorld::Item* item = mPlayer->mInventory.getItemAt(target);
+        if (item->getAsGoldItem())
         {
-            case FAWorld::ItemType::gold:
-            {
-                mGoldSplitTarget = &item;
-                mGoldSplitCnt = 0;
-                break;
-            }
-            default:
-                break;
+            mGoldSplitTarget = target;
+            mGoldSplitCnt = 0;
+        }
+        if (item->getAsUsableItem())
+        {
+            FAWorld::PlayerInput::UseItemData input{target};
+            Engine::EngineMain::get()->getLocalInputHandler()->addInput(FAWorld::PlayerInput(input, mPlayer->getId()));
         }
     }
 
-    void GuiManager::item(nk_context* ctx, FAWorld::EquipTarget target, boost::variant<struct nk_rect, struct nk_vec2> placement, ItemHighlightInfo highlight)
+    void GuiManager::item(nk_context* ctx, FAWorld::EquipTarget target, RectOrVec2 placement, ItemHighlightInfo highlight, bool checkerboarded)
     {
-        auto& inv = mPlayer->mInventory;
-        using namespace FAWorld;
-        if (!inv.getItemAt(MakeEquipTarget<EquipTargetType::cursor>()).isEmpty())
+        FAWorld::CharacterInventory& inv = mPlayer->mInventory;
+        if (inv.getCursorHeld())
             highlight = ItemHighlightInfo::notHighlighed;
-        bool checkerboarded = false;
 
-        auto& item = inv.getItemAt(target);
-        if (item.isEmpty())
+        const FAWorld::Item* item = inv.getItemAt(target);
+        if (!item)
             return;
-        if (!item.mIsReal)
-        {
-            if (item.getEquipLoc() == FAWorld::ItemEquipType::twoHanded && target.type == FAWorld::EquipTargetType::rightHand)
-            {
-                checkerboarded = true;
-                highlight = ItemHighlightInfo::notHighlighed;
-            }
-            else
-                return;
-        }
 
-        auto renderer = FARender::Renderer::get();
-
-        auto frame = item.getGraphicValue();
-        auto imgPath = "data/inv/objcurs.cel";
-        auto sprite = renderer->loadImage(imgPath);
-        auto img = sprite->getNkImage(frame);
-        auto w = sprite->getWidth(frame);
-        auto h = sprite->getHeight(frame);
+        struct nk_image itemIcon = item->getInventoryIcon()->getNkImage();
+        int32_t w = itemIcon.w;
+        int32_t h = itemIcon.h;
         bool isHighlighted = (highlight == ItemHighlightInfo::highlited);
 
-        boost::apply_visitor(
-            Misc::overload(
-                [&](const struct nk_rect& rect) { nk_layout_space_push(ctx, alignRect(nk_rect(0, 0, w, h), rect, halign_t::center, valign_t::center)); },
-                [&](const struct nk_vec2& point) {
-                    if (!item.mIsReal)
-                        return;
-                    nk_layout_space_push(ctx, nk_rect(point.x, point.y, w, h));
-                    if (highlight == ItemHighlightInfo::highlightIfHover)
-                    {
-                        nk_button_label_styled(ctx, &dummyStyle, "");
-                        if (isLastWidgetHovered(ctx))
-                        {
-                            isHighlighted = true;
-                        }
-                    }
-                }),
-            placement);
-        auto effectType = isHighlighted ? EffectType::highlighted : EffectType::none;
-        effectType = checkerboarded ? EffectType::checkerboarded : effectType;
+        switch (placement.type)
+        {
+            case RectOrVec2::Type::Rect:
+            {
+                struct nk_rect rect = placement.data.rect;
+                nk_layout_space_push(ctx, alignRect(nk_rect(0, 0, w, h), rect, halign_t::center, valign_t::center));
+                break;
+            }
+            case RectOrVec2::Type::Vec2:
+            {
+                struct nk_vec2 point = placement.data.vec2;
+
+                nk_layout_space_push(ctx, nk_rect(point.x, point.y, w, h));
+                if (highlight == ItemHighlightInfo::highlightIfHover)
+                {
+                    nk_button_label_styled(ctx, &dummyStyle, "");
+                    if (isLastWidgetHovered(ctx))
+                        isHighlighted = true;
+                }
+                break;
+            }
+        }
+        auto effectType = isHighlighted ? GuiEffectType::highlighted : GuiEffectType::none;
+        effectType = checkerboarded ? GuiEffectType::checkerboarded : effectType;
         if (isHighlighted)
-            mHoveredInventoryItemText = item.getFullDescription();
-        applyEffect effect(ctx, effectType);
-        nk_image(ctx, img);
-        if (nk_widget_is_mouse_click_down_inactive(ctx, NK_BUTTON_RIGHT) && mPlayer->mInventory.getItemAt(MakeEquipTarget<EquipTargetType::cursor>()).isEmpty())
+            mHoveredInventoryItemText = item->getFullDescription();
+        ScopedApplyEffect effect(ctx, effectType);
+        nk_image(ctx, itemIcon);
+        if (nk_widget_is_mouse_click_down_inactive(ctx, NK_BUTTON_RIGHT) && !mPlayer->mInventory.getCursorHeld())
             triggerItem(target);
     }
 
@@ -445,22 +255,38 @@ namespace FAGui
             FAWorld::CharacterInventory& inv = mPlayer->mInventory;
             nk_layout_space_begin(ctx, NK_STATIC, 0, INT_MAX);
             {
-                for (auto& p : slotRectangles)
+                for (auto& pair : slotRectangles)
                 {
-                    nk_layout_space_push(ctx, p.second);
+                    EquipTarget target = pair.first;
+                    struct nk_rect area = pair.second;
+                    bool checkerboarded = false;
+
+                    // Show two-handed weapons in both hands
+                    if (target.type == EquipTargetType::rightHand)
+                    {
+                        EquippedInHandsItems handsItems = inv.getItemsInHands();
+                        if (handsItems.weapon && handsItems.weapon->item->getBase()->getEquipType() == ItemEquipType::twoHanded)
+                        {
+                            target = MakeEquipTarget<FAWorld::EquipTargetType::leftHand>();
+                            checkerboarded = true;
+                        }
+                    }
+
+                    nk_layout_space_push(ctx, area);
                     nk_button_label_styled(ctx, &dummyStyle, "");
                     if (nk_widget_is_mouse_click_down_inactive(ctx, NK_BUTTON_LEFT))
                     {
-                        FAWorld::PlayerInput::InventorySlotClickedData input{p.first};
+                        FAWorld::PlayerInput::InventorySlotClickedData input{target};
                         Engine::EngineMain::get()->getLocalInputHandler()->addInput(FAWorld::PlayerInput(input, mPlayer->getId()));
                     }
                     auto highlight = ItemHighlightInfo::notHighlighed;
                     if (isLastWidgetHovered(ctx))
                         highlight = ItemHighlightInfo::highlited;
 
-                    item(ctx, p.first, p.second, highlight);
+                    item(ctx, target, area, highlight, checkerboarded);
                 }
             }
+
             constexpr float cellSize = 29;
             auto invTopLeft = nk_vec2(17, 222);
 
@@ -472,46 +298,68 @@ namespace FAGui
             nk_button_label_styled(ctx, &dummyStyle, "");
             if (nk_widget_is_mouse_click_down_inactive(ctx, NK_BUTTON_LEFT) && !mGoldSplitTarget)
             {
-                Misc::Point clickedPoint{int32_t(std::floor((ctx->input.mouse.pos.x - invTopLeft.x - ctx->current->bounds.x) / cellSize)),
-                                         int32_t(std::floor((ctx->input.mouse.pos.y - invTopLeft.y - ctx->current->bounds.y) / cellSize))};
+                // Adjust for cursor offset when items are held.
+                // When items are held, their sprites are centered around the cursor (rather then top left).
+                struct nk_vec2 cursorOffset = nk_vec2(0, 0);
+                if (const Item* item = mPlayer->mInventory.getCursorHeld())
+                {
+                    Vec2i invSize = item->getBase()->mSize;
+                    cursorOffset = {(1.0f - invSize.w) * cellSize / 2, (1.0f - invSize.h) * cellSize / 2};
+                }
+                Misc::Point clickedPoint{int32_t(std::floor((ctx->input.mouse.pos.x - invTopLeft.x - ctx->current->bounds.x + cursorOffset.x) / cellSize)),
+                                         int32_t(std::floor((ctx->input.mouse.pos.y - invTopLeft.y - ctx->current->bounds.y + cursorOffset.y) / cellSize))};
 
                 FAWorld::PlayerInput::InventorySlotClickedData input{
                     FAWorld::MakeEquipTarget<FAWorld::EquipTargetType::inventory>(clickedPoint.x, clickedPoint.y)};
                 Engine::EngineMain::get()->getLocalInputHandler()->addInput(FAWorld::PlayerInput(input, mPlayer->getId()));
             }
 
-            for (auto row : boost::counting_range(0, mainInventory.height()))
-                for (auto col : boost::counting_range(0, mainInventory.width()))
-                {
-                    auto cell_top_left = nk_vec2(17 + col * cellSize, 222 + row * cellSize);
-                    item(ctx, MakeEquipTarget<FAWorld::EquipTargetType::inventory>(col, row), cell_top_left, ItemHighlightInfo::highlightIfHover);
-                }
+            for (const auto& fullSlot : inv.getInv(FAWorld::EquipTargetType::inventory))
+            {
+                auto cell_top_left = nk_vec2(invTopLeft.x + fullSlot.topLeft.x * cellSize, invTopLeft.y + fullSlot.topLeft.y * cellSize);
+                item(ctx,
+                     MakeEquipTarget<FAWorld::EquipTargetType::inventory>(fullSlot.topLeft.x, fullSlot.topLeft.y),
+                     cell_top_left,
+                     ItemHighlightInfo::highlightIfHover,
+                     false);
+            }
+
             if (mGoldSplitTarget)
             {
-                int32_t screenW, screenH;
-                auto renderer = FARender::Renderer::get();
-                renderer->getWindowDimensions(screenW, screenH);
-                auto img = renderer->loadImage("ctrlpan/golddrop.cel");
-                double leftTopX = 31.0, leftTopY = 42.0;
-                nk_layout_space_push(ctx, nk_rect(leftTopX, leftTopY, img->getWidth(), img->getHeight()));
-                nk_image(ctx, img->getNkImage());
-                auto spacing = 28.0;
-                auto doTextLine = [&](const char* text, double y) {
-                    nk_layout_space_push(ctx, nk_rect(leftTopX + spacing, y, img->getWidth() - 2 * spacing, renderer->smallFont()->height));
-                    smallText(ctx, text, TextColor::golden, NK_TEXT_ALIGN_CENTERED | NK_TEXT_ALIGN_TOP);
-                };
-                doTextLine((boost::format("You have %1% gold") % mGoldSplitTarget->mCount).str().c_str(), 76.0);
-                doTextLine((boost::format("%1%.  How many do") % (mGoldSplitTarget->mCount > 1 ? "pieces" : "piece")).str().c_str(), 92.0);
-                doTextLine("you want to remove?", 110.0);
+                const Item* goldSplitTargetItem = mPlayer->mInventory.getItemAt(*mGoldSplitTarget);
+                const GoldItem* goldItem = goldSplitTargetItem->getAsGoldItem();
+                if (!goldItem)
                 {
-                    auto offset = 6;
-                    nk_layout_space_push(ctx, nk_rect(leftTopX + spacing + offset, 129.0, img->getWidth() - 2 * spacing, renderer->smallFont()->height));
-                    auto text = mGoldSplitCnt ? std::to_string(mGoldSplitCnt) : "";
-                    smallText(ctx, text.c_str(), TextColor::white, NK_TEXT_ALIGN_LEFT | NK_TEXT_ALIGN_TOP);
-                    auto width = smallTextWidth(text.c_str());
-                    auto spr = mSmallPentagram->getCurrentFrame().first;
-                    nk_layout_space_push(ctx, nk_rect(leftTopX + spacing + offset + width, 129.0, spr->getWidth(), spr->getHeight()));
-                    nk_image(ctx, mSmallPentagram->getCurrentNkImage());
+                    mGoldSplitTarget = std::nullopt;
+                }
+                else
+                {
+                    int32_t screenW = 0, screenH = 0;
+                    FARender::Renderer* renderer = FARender::Renderer::get();
+                    renderer->getWindowDimensions(screenW, screenH);
+                    Render::SpriteGroup* img = renderer->mSpriteLoader.getSprite(renderer->mSpriteLoader.mGuiSprites.goldSplitBackground);
+                    float leftTopX = 31.0, leftTopY = 42.0;
+                    nk_layout_space_push(ctx, nk_rect(leftTopX, leftTopY, img->getWidth(), img->getHeight()));
+                    nk_image(ctx, img->getNkImage());
+                    float spacing = 28.0;
+                    auto doTextLine = [&](const char* text, double y) {
+                        nk_layout_space_push(ctx, nk_rect(leftTopX + spacing, y, img->getWidth() - 2 * spacing, renderer->smallFont()->height));
+                        smallText(ctx, text, TextColor::golden, NK_TEXT_ALIGN_CENTERED | NK_TEXT_ALIGN_TOP);
+                    };
+
+                    doTextLine(fmt::format("You have {} gold", goldItem->getCount()).c_str(), 76.0);
+                    doTextLine(fmt::format("{}.  How many do", (goldItem->getCount() > 1 ? "pieces" : "piece")).c_str(), 92.0);
+                    doTextLine("you want to remove?", 110.0);
+                    {
+                        auto offset = 6;
+                        nk_layout_space_push(ctx, nk_rect(leftTopX + spacing + offset, 129.0, img->getWidth() - 2 * spacing, renderer->smallFont()->height));
+                        auto text = mGoldSplitCnt ? std::to_string(mGoldSplitCnt) : "";
+                        smallText(ctx, text.c_str(), TextColor::white, NK_TEXT_ALIGN_LEFT | NK_TEXT_ALIGN_TOP);
+                        auto width = smallTextWidth(text.c_str());
+                        auto spr = mSmallPentagram->getCurrentFrame().first;
+                        nk_layout_space_push(ctx, nk_rect(leftTopX + spacing + offset + width, 129.0, spr->getWidth(), spr->getHeight()));
+                        nk_image(ctx, mSmallPentagram->getCurrentNkImage());
+                    }
                 }
             }
             nk_layout_space_end(ctx);
@@ -529,20 +377,50 @@ namespace FAGui
         drawPanel(ctx, PanelType::character, [&]() {
             nk_layout_space_begin(ctx, NK_STATIC, 0, INT_MAX);
 
-            fillTextField(ctx, 168, 21, 131, toString(mPlayer->getClass()));
-            auto& playerStats = mPlayer->getPlayerStats();
-            fillTextField(ctx, 95, 144, 31, std::to_string(playerStats.mStrength).c_str());
-            fillTextField(ctx, 95, 172, 31, std::to_string(playerStats.mMagic).c_str());
-            fillTextField(ctx, 95, 200, 31, std::to_string(playerStats.mDexterity).c_str());
-            fillTextField(ctx, 95, 228, 31, std::to_string(playerStats.mVitality).c_str());
+            const FAWorld::ActorStats& playerStats = mPlayer->getStats();
+            const FAWorld::LiveActorStats& liveStats = playerStats.getCalculatedStats();
+
+            fillTextField(ctx, 168, 21, 131, playerClassToString(mPlayer->getClass()));
+
+            fillTextField(ctx, 95, 144, 31, std::to_string(playerStats.baseStats.strength).c_str());
+            fillTextField(ctx, 142, 144, 31, std::to_string(liveStats.baseStats.strength).c_str());
+
+            fillTextField(ctx, 95, 172, 31, std::to_string(playerStats.baseStats.magic).c_str());
+            fillTextField(ctx, 142, 172, 31, std::to_string(liveStats.baseStats.magic).c_str());
+
+            fillTextField(ctx, 95, 200, 31, std::to_string(playerStats.baseStats.dexterity).c_str());
+            fillTextField(ctx, 142, 200, 31, std::to_string(liveStats.baseStats.dexterity).c_str());
+
+            fillTextField(ctx, 95, 228, 31, std::to_string(playerStats.baseStats.vitality).c_str());
+            fillTextField(ctx, 142, 228, 31, std::to_string(playerStats.baseStats.vitality).c_str());
+
+            fillTextField(ctx, 73, 59, 31, std::to_string(playerStats.mLevel).c_str());
+            fillTextField(ctx, 216, 59, 84, std::to_string(playerStats.mExperience).c_str());
+            fillTextField(ctx, 216, 87, 84, std::to_string(playerStats.nextLevelExperience()).c_str());
 
             fillTextField(ctx, 216, 135, 84, std::to_string(mPlayer->mInventory.getTotalGold()).c_str());
-            auto& stats = mPlayer->getStats();
-            fillTextField(ctx, 95, 293, 31, std::to_string(stats.mHp.max).c_str());
-            fillTextField(ctx, 143, 293, 31, std::to_string(stats.mHp.current).c_str(), stats.mHp.current < stats.mHp.max ? TextColor::red : TextColor::white);
-            fillTextField(ctx, 95, 321, 31, std::to_string(stats.mMana.max).c_str());
-            fillTextField(
-                ctx, 143, 321, 31, std::to_string(stats.mMana.current).c_str(), stats.mMana.current < stats.mMana.max ? TextColor::red : TextColor::white);
+            fillTextField(ctx, 95, 293, 31, std::to_string(playerStats.getHp().max).c_str());
+            fillTextField(ctx,
+                          143,
+                          293,
+                          31,
+                          std::to_string(playerStats.getHp().current).c_str(),
+                          playerStats.getHp().current < playerStats.getHp().max ? TextColor::red : TextColor::white);
+            fillTextField(ctx, 95, 321, 31, std::to_string(playerStats.getMana().max).c_str());
+            fillTextField(ctx,
+                          143,
+                          321,
+                          31,
+                          std::to_string(playerStats.getMana().current).c_str(),
+                          playerStats.getMana().current < playerStats.getMana().max ? TextColor::red : TextColor::white);
+
+            fillTextField(ctx, 257, 172, 43, std::to_string(liveStats.armorClass).c_str());
+            fillTextField(ctx, 257, 200, 43, (std::to_string(liveStats.toHitMelee.base) + "%").c_str());
+
+            int32_t damageBase = mPlayer->mInventory.isRangedWeaponEquipped() ? liveStats.rangedDamage : liveStats.meleeDamage;
+            IntRange damageBonusRange = mPlayer->mInventory.isRangedWeaponEquipped() ? liveStats.rangedDamageBonusRange : liveStats.meleeDamageBonusRange;
+            std::string damageText = std::to_string(damageBase + damageBonusRange.start) + "-" + std::to_string(damageBase + damageBonusRange.end);
+            fillTextField(ctx, 257, 228, 43, damageText.c_str());
 
             nk_layout_space_end(ctx);
         });
@@ -555,15 +433,93 @@ namespace FAGui
 
     void GuiManager::spellsPanel(nk_context* ctx)
     {
-        drawPanel(ctx, PanelType::spells, [&]() {});
+        drawPanel(ctx, PanelType::spells, [&]() {
+            nk_layout_space_begin(ctx, NK_STATIC, 0, INT_MAX);
+
+            FARender::Renderer* renderer = FARender::Renderer::get();
+            Render::SpriteGroup* selectedTabButtons = renderer->mSpriteLoader.getSprite(renderer->mSpriteLoader.mGuiSprites.spellsButtons);
+            Render::SpriteGroup* icons = renderer->mSpriteLoader.getSprite(renderer->mSpriteLoader.mGuiSprites.spellIconsSmall);
+
+            int32_t buttonWidth = selectedTabButtons->getWidth();
+            int32_t buttonHeight = selectedTabButtons->getHeight();
+            int32_t iconWidth = icons->getWidth();
+            int32_t iconHeight = icons->getHeight();
+
+            nk_style_button buttonStyle = dummyStyle;
+
+            // Add the spell icons on the left of the panel
+            for (int i = 0; i < 7; i++)
+            {
+                FAWorld::SpellId spell;
+                if (mCurSpellbookTab == 0 && i == 0)
+                    spell = mPlayer->defaultSkill();
+                else
+                    spell = FAWorld::SpellData::spellbookLUT[mCurSpellbookTab][i];
+
+                auto spellData = FAWorld::SpellData(spell);
+                int frame = spellData.getFrameIndex();
+                int32_t yPos = 19 + i * 43;
+                nk_layout_space_push(ctx, nk_rect(10, yPos, iconHeight, iconWidth));
+
+                // Temporary quirk to only allow implemented spells to be used.
+                if (FAWorld::SpellData::isSpellImplemented(spell))
+                {
+                    buttonStyle.normal = buttonStyle.hover = buttonStyle.active = nk_style_item_image(icons->getNkImage(frame));
+                    if (nk_button_label_styled(ctx, &buttonStyle, ""))
+                    {
+                        // Set active spell
+                        FAWorld::PlayerInput::SetActiveSpellData input{spell};
+                        Engine::EngineMain::get()->getLocalInputHandler()->addInput(FAWorld::PlayerInput(input, mPlayer->getId()));
+                    }
+
+                    // Highlight selected spell
+                    if (spell == mPlayer->getPlayerBehaviour()->mActiveSpell)
+                        nk_image(ctx, icons->getNkImage(42));
+                }
+                else
+                {
+                    // Grey out unimplemented spells.
+                    nk_image_color(ctx, icons->getNkImage(frame), {64, 64, 64, 255});
+                }
+
+                nk_layout_space_push(ctx, nk_rect(65, yPos + 3, 131, FARender::Renderer::get()->smallFont()->height));
+                smallText(ctx, spellData.name().c_str(), TextColor::white, NK_TEXT_ALIGN_LEFT | NK_TEXT_ALIGN_TOP);
+
+                nk_layout_space_push(ctx, nk_rect(65, yPos + 14, 131, FARender::Renderer::get()->smallFont()->height));
+                smallText(ctx, "Skill", TextColor::white, NK_TEXT_ALIGN_LEFT | NK_TEXT_ALIGN_TOP);
+            }
+
+            // Add the buttons at the bottom of the panel
+            for (int i = 0; i < 4; i++)
+            {
+                int32_t xPos = 8 + i * 76;
+                nk_layout_space_push(ctx, nk_rect(xPos, 320, buttonWidth, buttonHeight));
+                buttonStyle.active = nk_style_item_image(selectedTabButtons->getNkImage(i));
+                if (mCurSpellbookTab == i)
+                    buttonStyle.normal = buttonStyle.hover = buttonStyle.active;
+                else
+                    buttonStyle.normal = buttonStyle.hover = nk_style_item_hide();
+                if (nk_button_label_styled(ctx, &buttonStyle, ""))
+                {
+                    mCurSpellbookTab = i;
+                    // As soon as button is released it returns to buttonStyle.hover (unselected), the next loop
+                    // though here updates buttonStyle.hover to "selected", but there is a slight flicker between
+                    // frames without the following:
+                    nk_image(ctx, selectedTabButtons->getNkImage(i));
+                }
+            }
+            nk_layout_space_end(ctx);
+        });
     }
 
     void GuiManager::belt(nk_context* ctx)
     {
-        auto beltTopLeft = nk_vec2(205, 21);
-        auto beltWidth = 232.0f, beltHeight = 29.0f, cellSize = 29.0f;
+        struct nk_vec2 beltTopLeft = nk_vec2(205, 21);
+        float beltWidth = 232.0f, beltHeight = 29.0f, cellSize = 29.0f;
+
         nk_layout_space_push(ctx, nk_recta(beltTopLeft, {beltWidth, beltHeight}));
-        auto& inv = mPlayer->mInventory;
+        FAWorld::CharacterInventory& inv = mPlayer->mInventory;
+
         if (nk_widget_is_mouse_click_down_inactive(ctx, NK_BUTTON_LEFT) && !mGoldSplitTarget)
         {
             FAWorld::PlayerInput::InventorySlotClickedData input{FAWorld::MakeEquipTarget<FAWorld::EquipTargetType::belt>(
@@ -571,11 +527,10 @@ namespace FAGui
             Engine::EngineMain::get()->getLocalInputHandler()->addInput(FAWorld::PlayerInput(input, mPlayer->getId()));
         }
 
-        using namespace FAWorld;
-        for (auto num : boost::counting_range(0, int32_t(inv.getInv(FAWorld::EquipTargetType::belt).width())))
+        for (const auto& fullSlot : inv.getInv(FAWorld::EquipTargetType::belt))
         {
-            auto cell_top_left = nk_vec2(beltTopLeft.x + num * cellSize, beltTopLeft.y);
-            item(ctx, MakeEquipTarget<FAWorld::EquipTargetType::belt>(num), cell_top_left, ItemHighlightInfo::highlightIfHover);
+            auto cell_top_left = nk_vec2(beltTopLeft.x + fullSlot.topLeft.x * cellSize, beltTopLeft.y);
+            item(ctx, FAWorld::MakeEquipTarget<FAWorld::EquipTargetType::belt>(fullSlot.topLeft.x), cell_top_left, ItemHighlightInfo::highlightIfHover, false);
         }
         nk_layout_space_end(ctx);
     }
@@ -587,9 +542,10 @@ namespace FAGui
         // The bottom menu is made of two sprites: panel8.cel, which is the background,
         // and panel8bu.cel, which contains overlays for each button. It's pretty primitive,
         // the buttons are baked into the background image.
-        FARender::FASpriteGroup* bottomMenuTex = renderer->loadImage("ctrlpan/panel8.cel");
-        FARender::FASpriteGroup* bottomMenuButtonsTex = renderer->loadImage("ctrlpan/panel8bu.cel");
-        FARender::FASpriteGroup* healthAndManaEmptyBulbs = renderer->loadImage("ctrlpan/p8bulbs.cel");
+        Render::SpriteGroup* bottomMenuTex = renderer->mSpriteLoader.getSprite(renderer->mSpriteLoader.mGuiSprites.bottomMenu);
+        Render::SpriteGroup* bottomMenuButtonsTex = renderer->mSpriteLoader.getSprite(renderer->mSpriteLoader.mGuiSprites.bottomMenuButtons);
+        Render::SpriteGroup* healthAndManaEmptyBulbs = renderer->mSpriteLoader.getSprite(renderer->mSpriteLoader.mGuiSprites.bottomMenuBulbs);
+        Render::SpriteGroup* spellIcons = renderer->mSpriteLoader.getSprite(renderer->mSpriteLoader.mGuiSprites.spellIcons);
 
         int32_t bulbWidth = healthAndManaEmptyBulbs->getWidth();
         int32_t bulbHeight = healthAndManaEmptyBulbs->getHeight();
@@ -619,6 +575,9 @@ namespace FAGui
 
         int32_t healthBulbLeftOffset = 96;
         int32_t manaBulbLeftOffset = 464;
+
+        int32_t activeSpellLeftOffset = 565;
+        int32_t activeSpellTopIndent = 80;
 
         // Centre the bottom menu on the bottom of the screen
         int32_t screenW, screenH;
@@ -716,13 +675,139 @@ namespace FAGui
 
                                const FAWorld::ActorStats& stats = Engine::EngineMain::get()->mWorld->getCurrentPlayer()->getStats();
                                // draw current hp into health bulb
-                               drawBulb(stats.mHp.current, stats.mHp.max, healthBulbLeftOffset);
+                               drawBulb(stats.getHp().current, stats.getHp().max, healthBulbLeftOffset);
                                // and current mana
-                               drawBulb(stats.mMana.current, stats.mMana.current, manaBulbLeftOffset);
+                               drawBulb(stats.getMana().current, stats.getMana().max, manaBulbLeftOffset);
 
                                belt(ctx);
                                descriptionPanel(ctx, hoverStatus.getDescription(*Engine::EngineMain::get()->mWorld->getCurrentLevel()));
 
+                               // Active spell
+                               int frame = (int)FAWorld::SpellData::SpellHighlightFrame::blank;
+                               auto activeSpell = mPlayer->getPlayerBehaviour()->mActiveSpell;
+
+                               if (activeSpell != FAWorld::SpellId::null)
+                               {
+                                   auto spellData = FAWorld::SpellData(activeSpell);
+                                   frame = spellData.getFrameIndex();
+                               }
+                               buttonStyle.normal = buttonStyle.hover = buttonStyle.active = nk_style_item_image(spellIcons->getNkImage(frame));
+                               nk_layout_space_push(ctx, nk_rect(activeSpellLeftOffset, activeSpellTopIndent, spellIcons->getWidth(), spellIcons->getHeight()));
+                               if (nk_button_label_styled(ctx, &buttonStyle, ""))
+                                   // Toggle spell selection menu
+                                   mShowSpellSelectionMenu = !mShowSpellSelectionMenu;
+
+                               // Overlay selected hotkey symbol (F5->F8)
+                               if (activeSpell != FAWorld::SpellId::null)
+                               {
+                                   for (int j = 0; j < 4; j++)
+                                   {
+                                       if (activeSpell == mPlayer->getPlayerBehaviour()->mSpellHotkey[j])
+                                       {
+                                           int hotkeyFrame = (int)FAWorld::SpellData::SpellHighlightFrame::hotkeyF5 + j;
+                                           nk_image(ctx, spellIcons->getNkImage(hotkeyFrame));
+                                       }
+                                   }
+                               }
+
+                               nk_layout_space_end(ctx);
+                           },
+                           false);
+    }
+
+    void GuiManager::spellSelectionMenu(nk_context* ctx)
+    {
+        // This is the menu that pops up when the spell icon on the bottom menu in clicked (or 's' hotkey).
+        // It allows the player to select the active spell, as well as configure F5->F8 hotkeys.
+        if (!mShowSpellSelectionMenu)
+            return;
+
+        FARender::Renderer* renderer = FARender::Renderer::get();
+        Render::SpriteGroup* spellIcons = renderer->mSpriteLoader.getSprite(renderer->mSpriteLoader.mGuiSprites.spellIcons);
+        int32_t iconWidth = spellIcons->getWidth();
+        int32_t iconHeight = spellIcons->getHeight();
+
+        int32_t menuWidth = 640;
+        int32_t menuHeight = iconHeight * 3;
+
+        // Centre the bottom menu on the bottom of the screen
+        int32_t screenW, screenH;
+        renderer->getWindowDimensions(screenW, screenH);
+        struct nk_rect dims = nk_rect((screenW / 2) - (menuWidth / 2), screenH - menuHeight - 144, menuWidth, menuHeight);
+
+        Misc::ScopedSetter<float> setter(ctx->style.button.border, 0);
+        Misc::ScopedSetter<struct nk_style_item> setter2(ctx->style.window.fixed_background, nk_style_item_hide());
+
+        nk_fa_begin_window(ctx,
+                           "spell_selection_menu",
+                           dims,
+                           NK_WINDOW_NO_SCROLLBAR | NK_WINDOW_BACKGROUND,
+                           [&]() {
+                               nk_layout_space_begin(ctx, NK_STATIC, 0, INT_MAX);
+
+                               static const int32_t spellbookCount = sizeof(FAWorld::SpellData::spellbookLUT) / sizeof(FAWorld::SpellData::spellbookLUT[0][0]);
+                               static const int32_t spellbookStride =
+                                   sizeof(FAWorld::SpellData::spellbookLUT[0]) / sizeof(FAWorld::SpellData::spellbookLUT[0][0]);
+                               static const int32_t numXIcons = 11;
+                               static const int32_t numYIcons = 3;
+
+                               for (int i = 0; i < spellbookCount; i++)
+                               {
+                                   FAWorld::SpellId spell;
+                                   if (i == 0)
+                                       spell = mPlayer->defaultSkill();
+                                   else
+                                       spell = FAWorld::SpellData::spellbookLUT[i / spellbookStride][i % spellbookStride];
+
+                                   auto spellData = FAWorld::SpellData(spell);
+                                   int frame = spellData.getFrameIndex();
+                                   // Centre horizontally
+                                   int32_t xOffset = (menuWidth - numXIcons * iconWidth) / 2;
+                                   // Start from bottom right, move left 11 icons, then move up and reset
+                                   int32_t xPos = ((numXIcons - 1) - (i % numXIcons)) * iconWidth + xOffset;
+                                   int32_t yPos = ((numYIcons - 1) - (i / numXIcons)) * iconHeight;
+                                   nk_layout_space_push(ctx, nk_rect(xPos, yPos, iconWidth, iconHeight));
+
+                                   // Temporary quirk to only allow implemented spells to be used.
+                                   if (FAWorld::SpellData::isSpellImplemented(spell))
+                                   {
+                                       nk_image(ctx, spellIcons->getNkImage(frame));
+                                       if (nk_widget_is_mouse_click_down_inactive(ctx, NK_BUTTON_LEFT))
+                                       {
+                                           // Set active spell and hide, spell selection menu
+                                           FAWorld::PlayerInput::SetActiveSpellData input{spell};
+                                           Engine::EngineMain::get()->getLocalInputHandler()->addInput(FAWorld::PlayerInput(input, mPlayer->getId()));
+                                           mShowSpellSelectionMenu = false;
+                                       }
+
+                                       if (isLastWidgetHovered(ctx))
+                                       {
+                                           // Highlight when hovered
+                                           nk_image(ctx, spellIcons->getNkImage((int)FAWorld::SpellData::SpellHighlightFrame::spell));
+                                           // Keep track of current hovered spell, this is used to set active spell when spell hotkeys (F5->F8) are pressed
+                                           mCurrentHoveredSpell = spell;
+                                       }
+
+                                       // Highlight selected spell
+                                       if (spell == mPlayer->getPlayerBehaviour()->mActiveSpell)
+                                           nk_image(ctx, spellIcons->getNkImage((int)FAWorld::SpellData::SpellHighlightFrame::highlight));
+
+                                       // Overlay selected hotkey symbol (F5->F8)
+                                       for (int j = 0; j < 4; j++)
+                                       {
+                                           if (spell == mPlayer->getPlayerBehaviour()->mSpellHotkey[j])
+                                           {
+                                               int hotkeyFrame = (int)FAWorld::SpellData::SpellHighlightFrame::hotkeyF5 + j;
+                                               nk_image(ctx, spellIcons->getNkImage(hotkeyFrame));
+                                           }
+                                       }
+                                   }
+                                   else
+                                   {
+                                       // Grey out unimplemented spells.
+                                       nk_image_color(ctx, spellIcons->getNkImage(frame), {64, 64, 64, 255});
+                                   }
+                               }
                                nk_layout_space_end(ctx);
                            },
                            false);
@@ -730,28 +815,13 @@ namespace FAGui
 
     void GuiManager::startingScreen() { mMenuHandler->setActiveScreen<StartingMenuScreen>(); }
 
+    void GuiManager::connectingScreen() { mMenuHandler->setActiveScreen<MultiplayerConnecting>(); }
+
     void GuiManager::smallText(nk_context* ctx, const char* text, TextColor color, nk_flags alignment)
     {
         FARender::Renderer* renderer = FARender::Renderer::get();
         nk_style_push_font(ctx, renderer->smallFont());
-        nk_style_push_color(ctx, &ctx->style.text.color, [color]() {
-            // Warning: These colors just placeholder similar colors (except white obviously),
-            // To achieve real Diablo palette coloring of smaltext.cel we need to apply palette shift
-            // which could not be represented as color multiplication so it's bettter to
-            // probably generate separate textures in the time of decoding.
-            switch (color)
-            {
-                case TextColor::white:
-                    return nk_color{255, 255, 255, 255};
-                case TextColor::blue:
-                    return nk_color{170, 170, 255, 255};
-                case TextColor::golden:
-                    return nk_color{225, 225, 155, 255};
-                case TextColor::red:
-                    return nk_color{255, 128, 128, 255};
-            }
-            return nk_color{255, 255, 255, 255};
-        }());
+        nk_style_push_color(ctx, &ctx->style.text.color, getNkColor(color));
         nk_label(ctx, text, alignment);
         nk_style_pop_color(ctx);
         nk_style_pop_font(ctx);
@@ -776,8 +846,7 @@ namespace FAGui
             textToUse = &mHoveredInventoryItemText;
 
         auto boxRect = nk_rect(185, 66, 275, 55);
-        std::vector<std::string> vec;
-        boost::split(vec, *textToUse, boost::is_any_of("\n"), boost::token_compress_on);
+        std::vector<std::string> vec = Misc::StringUtils::split(*textToUse, '\n', Misc::StringUtils::SplitEmptyBehavior::StripEmpties);
         auto h_part = boxRect.h / vec.size();
         for (int i = 0; i < static_cast<int>(vec.size()); ++i)
         {
@@ -792,6 +861,8 @@ namespace FAGui
 
     void GuiManager::update(bool inGame, bool paused, nk_context* ctx, const FAWorld::HoverStatus& hoverStatus)
     {
+        nk_style_push_font(ctx, FARender::Renderer::get()->smallFont());
+
         // HACK FUCKING HACK
         FAWorld::World* world = Engine::EngineMain::get()->mWorld.get();
         mPlayer = world == nullptr ? nullptr : world->getCurrentPlayer();
@@ -821,7 +892,9 @@ namespace FAGui
             questsPanel(ctx);
             characterPanel(ctx);
             bottomMenu(ctx, hoverStatus);
-            dialog(ctx);
+            spellSelectionMenu(ctx);
+
+            mDialogManager.update(ctx);
         }
         else
         {
@@ -832,9 +905,11 @@ namespace FAGui
             Engine::EngineMain::get()->getLocalInputHandler()->blockInput();
         else
             Engine::EngineMain::get()->getLocalInputHandler()->unblockInput();
+
+        nk_style_pop_font(ctx);
     }
 
-    PanelType* GuiManager::panel(PanelPlacement placement)
+    PanelType* GuiManager::getPanelAtLocation(PanelPlacement placement)
     {
         switch (placement)
         {
@@ -848,43 +923,53 @@ namespace FAGui
         return nullptr;
     }
 
-    const PanelType* GuiManager::panel(PanelPlacement placement) const { return const_cast<self*>(this)->panel(placement); }
+    const PanelType* GuiManager::getPanelAtLocation(PanelPlacement placement) const { return const_cast<self*>(this)->getPanelAtLocation(placement); }
+
+    bool GuiManager::hotkeysEnabled() const
+    {
+        if (!mEngine.mInGame)
+            return false;
+
+        // Can't use hotkeys when dialogs are open.
+        // TODO: mGoldSplitTarget might be better as a standard dialog if possible?
+        if (mGoldSplitTarget || mDialogManager.hasDialog())
+            return false;
+
+        return true;
+    }
 
     void GuiManager::notify(Engine::KeyboardInputAction action)
     {
-        if (!mDialogs.empty())
-        {
-            mDialogs.back().notify(action, *this);
-            return;
-        }
-
         switch (action)
         {
             case Engine::KeyboardInputAction::toggleQuests:
-                // for unknown reasons Diablo doesn't let you use hotkeys for dialogs when gold split is open
-                // note that normal buttons are working.
-                if (mGoldSplitTarget)
+                if (!hotkeysEnabled())
                     return;
                 togglePanel(PanelType::quests);
                 break;
             case Engine::KeyboardInputAction::toggleInventory:
-                if (mGoldSplitTarget)
+                if (!hotkeysEnabled())
                     return;
                 togglePanel(PanelType::inventory);
                 break;
             case Engine::KeyboardInputAction::toggleCharacterInfo:
-                if (mGoldSplitTarget)
+                if (!hotkeysEnabled())
                     return;
                 togglePanel(PanelType::character);
                 break;
             case Engine::KeyboardInputAction::toggleSpellbook:
-                if (mGoldSplitTarget)
+                if (!hotkeysEnabled())
                     return;
                 togglePanel(PanelType::spells);
                 break;
+            case Engine::KeyboardInputAction::toggleSpellSelection:
+                if (!hotkeysEnabled())
+                    return;
+                mShowSpellSelectionMenu = !mShowSpellSelectionMenu;
+                break;
             case Engine::KeyboardInputAction::reject:
                 if (mGoldSplitTarget)
-                    mGoldSplitTarget = nullptr;
+                    mGoldSplitTarget = std::nullopt;
                 break;
             case Engine::KeyboardInputAction::accept:
                 if (mGoldSplitTarget)
@@ -892,15 +977,29 @@ namespace FAGui
                     if (mGoldSplitCnt > 0)
                     {
                         FAWorld::PlayerInput input(
-                            FAWorld::PlayerInput::SplitGoldStackIntoCursorData{mGoldSplitTarget->mInvX, mGoldSplitTarget->mInvY, mGoldSplitCnt},
+                            FAWorld::PlayerInput::SplitGoldStackIntoCursorData{mGoldSplitTarget->posX, mGoldSplitTarget->posY, mGoldSplitCnt},
                             mPlayer->getId());
                         Engine::EngineMain::get()->getLocalInputHandler()->addInput(input);
                     }
 
-                    mGoldSplitTarget = nullptr;
+                    mGoldSplitTarget = std::nullopt;
                 }
                 break;
-
+            case Engine::KeyboardInputAction::spellHotkeyF5:
+            case Engine::KeyboardInputAction::spellHotkeyF6:
+            case Engine::KeyboardInputAction::spellHotkeyF7:
+            case Engine::KeyboardInputAction::spellHotkeyF8:
+                if (mShowSpellSelectionMenu)
+                {
+                    if (mCurrentHoveredSpell != FAWorld::SpellId::null)
+                    {
+                        // Assume these enum entries are sequential.
+                        int index = (int)action - (int)Engine::KeyboardInputAction::spellHotkeyF5;
+                        FAWorld::PlayerInput input(FAWorld::PlayerInput::ConfigureSpellHotkeyData{index, mCurrentHoveredSpell}, mPlayer->getId());
+                        Engine::EngineMain::get()->getLocalInputHandler()->addInput(input);
+                    }
+                }
+                break;
             default:
                 break;
         }
@@ -912,11 +1011,19 @@ namespace FAGui
     {
         if (mGoldSplitTarget && !key.has_modifiers())
         {
+            const FAWorld::Item* goldSplitTargetItem = mPlayer->mInventory.getItemAt(*mGoldSplitTarget);
+            const FAWorld::GoldItem* goldItem = goldSplitTargetItem->getAsGoldItem();
+            if (!goldItem)
+            {
+                mGoldSplitTarget = std::nullopt;
+                return;
+            }
+
             if (key.key >= '0' && key.key <= '9')
             {
-                int digit = key.key - '0';
-                auto newCnt = mGoldSplitCnt * 10 + digit;
-                if (newCnt <= mGoldSplitTarget->mCount)
+                int32_t digit = key.key - '0';
+                int32_t newCnt = mGoldSplitCnt * 10 + digit;
+                if (newCnt <= goldItem->getCount())
                     mGoldSplitCnt = newCnt;
             }
             else if (key.key == '\b')
@@ -930,43 +1037,42 @@ namespace FAGui
 
     bool GuiManager::isLastWidgetHovered(nk_context* ctx) const { return nk_inactive_widget_is_hovered(ctx) && !mEngine.isPaused(); }
 
-    bool GuiManager::isInventoryShown() const { return *panel(panelPlacementByType(PanelType::inventory)) == PanelType::inventory; }
+    bool GuiManager::isInventoryShown() const { return *getPanelAtLocation(panelPlacementByType(PanelType::inventory)) == PanelType::inventory; }
 
-    void GuiManager::popDialogData() { mDialogs.pop_back(); }
-
-    void GuiManager::pushDialogData(DialogData&& data)
-    {
-        mDialogs.push_back(std::move(data));
-        mSkipDialogFrame = true;
-    }
+    bool GuiManager::isSpellSelectionMenuShown() const { return mShowSpellSelectionMenu; }
 
     bool GuiManager::isPauseBlocked() const
     {
-        if (isModalDlgShown())
-            return true;
         if (mGoldSplitTarget)
             return true;
         return false;
     }
 
-    bool GuiManager::isModalDlgShown() const
+    bool GuiManager::isModalDlgShown() const { return mDialogManager.hasDialog(); }
+
+    void GuiManager::popModalDlg() { mDialogManager.popDialog(); }
+
+    bool GuiManager::anyPanelIsOpen() const
     {
-        if (!mDialogs.empty())
-            return true;
-        return false;
+        return (mCurLeftPanel != FAGui::PanelType::none || mCurRightPanel != FAGui::PanelType::none) || mShowSpellSelectionMenu;
+    }
+
+    void GuiManager::closeAllPanels()
+    {
+        mCurLeftPanel = FAGui::PanelType::none;
+        mCurRightPanel = FAGui::PanelType::none;
+        mShowSpellSelectionMenu = false;
+        mGoldSplitTarget = std::nullopt;
     }
 
     void GuiManager::togglePanel(PanelType type)
     {
-        auto& curPanel = *panel(panelPlacementByType(type));
+        auto& curPanel = *getPanelAtLocation(panelPlacementByType(type));
         if (curPanel == type)
             curPanel = PanelType::none;
         else
             curPanel = type;
         if (mCurRightPanel != PanelType::inventory)
-            mGoldSplitTarget = nullptr;
+            mGoldSplitTarget = std::nullopt;
     }
-
-    std::string cursorPath = "data/inv/objcurs.cel";
-    uint32_t cursorFrame = 0;
 }

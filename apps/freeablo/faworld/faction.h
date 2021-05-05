@@ -1,6 +1,4 @@
-
 #pragma once
-
 #include <cstdint>
 
 namespace FAWorld
@@ -29,9 +27,9 @@ namespace FAWorld
 
         static Faction heaven() { return Faction(FactionType::heaven); }
 
-        FactionType getType() { return mFaction; }
+        FactionType getType() const { return mFaction; }
 
     private:
-        FactionType mFaction;
+        FactionType mFaction = FactionType::heaven;
     };
 }

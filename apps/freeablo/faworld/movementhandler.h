@@ -1,11 +1,7 @@
-
 #pragma once
-
 #include "gamelevel.h"
 #include "position.h"
 #include "world.h"
-
-#include <boost/signals2/signal.hpp>
 
 namespace FASaveGame
 {
@@ -20,33 +16,36 @@ namespace FAWorld
     class MovementHandler
     {
     public:
-        MovementHandler(Tick pathRateLimit);
+        MovementHandler() = default;
+        explicit MovementHandler(FASaveGame::GameLoader& loader);
+        void save(FASaveGame::GameSaver& saver) const;
 
-        MovementHandler(FASaveGame::GameLoader& loader);
-        void save(FASaveGame::GameSaver& saver);
-
-        std::pair<int32_t, int32_t> getDestination() const;
-        void setDestination(std::pair<int32_t, int32_t> dest, bool adjacent = false);
+        Misc::Point getDestination() const;
+        void setDestination(Misc::Point dest, bool adjacent = false);
 
         bool moving();
         const Position& getCurrentPosition() const { return mCurrentPos; }
         GameLevel* getLevel();
-        void update(int32_t actorId);
+        const GameLevel* getLevel() const;
+        void update(Actor& actor);
         void teleport(GameLevel* level, Position pos);
-        void setDirection(Misc::Direction direction);
-
-        boost::signals2::signal<void(const std::pair<int32_t, int32_t>)> positionReached;
+        void stopMoving(FAWorld::Actor& actor, std::optional<Misc::Direction> pointInDirection = std::nullopt);
 
     private:
-        bool positionReachedSent = true;
+        FixedPoint updateInternal(Actor& actor, FixedPoint moveDistance);
+
+    public:
+        FixedPoint mSpeedTilesPerSecond;
+        Tick mPathRateLimit = World::getTicksInPeriod(1);
+
+    private:
         GameLevel* mLevel = nullptr;
         Position mCurrentPos;
-        std::pair<int32_t, int32_t> mDestination;
+        Misc::Point mDestination;
 
         int32_t mCurrentPathIndex = 0;
-        std::vector<std::pair<int32_t, int32_t>> mCurrentPath;
+        Misc::Points mCurrentPath;
         Tick mLastRepathed = std::numeric_limits<Tick>::min();
-        Tick mPathRateLimit;
         bool mAdjacent = false;
     };
 }

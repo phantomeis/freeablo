@@ -1,12 +1,13 @@
 #include "localinputhandler.h"
 #include "../fagui/guimanager.h"
+#include "../farender/levelrenderer.h"
 #include "../farender/renderer.h"
 #include "../faworld/player.h"
+#include "../faworld/playerbehaviour.h"
 #include "../faworld/target.h"
 #include "../faworld/world.h"
 #include "enginemain.h"
 #include "input/inputmanager.h"
-#include <misc/vec2fix.h>
 
 namespace Engine
 {
@@ -17,7 +18,9 @@ namespace Engine
         //        if (mWorld.mGuiManager->isModalDlgShown())
         //            return;
 
-        auto player = mWorld.getCurrentPlayer();
+        FAWorld::Player* player = mWorld.getCurrentPlayer();
+        if (!player)
+            return;
 
         switch (action)
         {
@@ -33,6 +36,36 @@ namespace Engine
                 return;
             }
 
+            case Engine::KeyboardInputAction::spellHotkeyF5:
+            case Engine::KeyboardInputAction::spellHotkeyF6:
+            case Engine::KeyboardInputAction::spellHotkeyF7:
+            case Engine::KeyboardInputAction::spellHotkeyF8:
+            {
+                if (EngineMain::get()->mGuiManager->isSpellSelectionMenuShown())
+                    return;
+                // Assume these enum entries are sequential.
+                int index = (int)action - (int)Engine::KeyboardInputAction::spellHotkeyF5;
+                auto spell = player->getPlayerBehaviour()->mSpellHotkey[index];
+                if (spell != FAWorld::SpellId::null)
+                {
+                    auto input = FAWorld::PlayerInput::SetActiveSpellData{spell};
+                    mInputs.emplace_back(input, player->getId());
+                }
+                return;
+            }
+
+            case Engine::KeyboardInputAction::toggleTextureFiltering:
+            {
+                FARender::Renderer::get()->mLevelRenderer->toggleTextureFiltering();
+                return;
+            }
+
+            case Engine::KeyboardInputAction::toggleDrawGrid:
+            {
+                FARender::Renderer::get()->mLevelRenderer->toggleGrid();
+                return;
+            }
+
             default:
             {
                 return;
@@ -40,7 +73,8 @@ namespace Engine
         }
     }
 
-    void LocalInputHandler::notify(MouseInputAction action, Misc::Point mousePosition, bool mouseDown, const Input::KeyboardModifiers& modifiers)
+    void
+    LocalInputHandler::notify(MouseInputAction action, Vec2i mousePosition, Vec2i mouseWheelDelta, bool mouseDown, const Input::KeyboardModifiers& modifiers)
     {
         if (mBlockedFramesLeft > 0)
             return;
@@ -48,57 +82,73 @@ namespace Engine
         auto player = mWorld.getCurrentPlayer();
         if (!player)
             return;
+
+        mLastModifiers = modifiers;
+
         switch (action)
         {
             case Engine::MouseInputAction::MOUSE_DOWN:
             {
+                mLastMousePosition = mousePosition;
+                mLeftMouseDown = mouseDown;
+                mIsDroppingItem = false;
+
                 auto clickedTile = FARender::Renderer::get()->getTileByScreenPos(mousePosition.x, mousePosition.y, player->getPos());
 
-                if (auto clickedActor = mWorld.targetedActor(mousePosition))
+                const FAWorld::Item* cursorItem = player->mInventory.getCursorHeld();
+                const FAWorld::Actor* clickedActor = mWorld.targetedActor(mousePosition);
+                if (modifiers.shift && !cursorItem)
+                {
+                    mInputs.emplace_back(FAWorld::PlayerInput::ForceAttackData{clickedTile.pos}, player->getId());
+                }
+                else if (clickedActor && !cursorItem)
                 {
                     mInputs.emplace_back(FAWorld::PlayerInput::TargetActorData{clickedActor->getId()}, player->getId());
                 }
-                else if (auto item = mWorld.targetedItem(mousePosition))
+                else if (const FAWorld::PlacedItemData* item = mWorld.targetedItem(mousePosition))
                 {
                     auto type = EngineMain::get()->mGuiManager->isInventoryShown() ? FAWorld::Target::ItemTarget::ActionType::toCursor
                                                                                    : FAWorld::Target::ItemTarget::ActionType::autoEquip;
-                    mInputs.emplace_back(FAWorld::PlayerInput::TargetItemOnFloorData{item->getTile().x, item->getTile().y, type}, player->getId());
+                    mInputs.emplace_back(FAWorld::PlayerInput::TargetItemOnFloorData{item->getTile(), type}, player->getId());
                 }
-                else if (modifiers.shift)
+                else if (player->getLevel()->isDoor(clickedTile.pos) || cursorItem)
                 {
-                    Misc::Direction direction =
-                        Vec2Fix(clickedTile.x - player->getPos().current().first, clickedTile.y - player->getPos().current().second).getIsometricDirection();
-                    mInputs.emplace_back(FAWorld::PlayerInput::AttackDirectionData{direction}, player->getId());
+                    if (cursorItem)
+                        mIsDroppingItem = true;
+                    mInputs.emplace_back(FAWorld::PlayerInput::TargetTileData{clickedTile.pos.x, clickedTile.pos.y}, player->getId());
                 }
                 else
                 {
-                    mInputs.emplace_back(FAWorld::PlayerInput::TargetTileData{clickedTile.x, clickedTile.y}, player->getId());
+                    mInputs.emplace_back(FAWorld::PlayerInput::DragOverTileData{clickedTile.pos.x, clickedTile.pos.y, true}, player->getId());
                 }
-
+                return;
+            }
+            case Engine::MouseInputAction::MOUSE_RELEASE:
+            {
+                mLastMousePosition = mousePosition;
+                mLeftMouseDown = mouseDown;
+                mIsDroppingItem = false;
+                return;
+            }
+            case Engine::MouseInputAction::RIGHT_MOUSE_DOWN:
+            {
+                auto clickedTile = FARender::Renderer::get()->getTileByScreenPos(mousePosition.x, mousePosition.y, player->getPos());
+                if (!player->mInventory.getCursorHeld())
+                    mInputs.emplace_back(FAWorld::PlayerInput::CastSpellData{clickedTile.pos.x, clickedTile.pos.y}, player->getId());
+                else
+                    mInputs.emplace_back(FAWorld::PlayerInput::TargetTileData{clickedTile.pos.x, clickedTile.pos.y}, player->getId());
                 return;
             }
             case Engine::MouseInputAction::MOUSE_MOVE:
             {
-                if (mouseDown)
-                {
-                    auto clickedTile = FARender::Renderer::get()->getTileByScreenPos(mousePosition.x, mousePosition.y, player->getPos());
-                    mInputs.emplace_back(FAWorld::PlayerInput::DragOverTileData{clickedTile.x, clickedTile.y}, player->getId());
-                }
-
-                this->mHoverStatus = FAWorld::HoverStatus();
-
-                auto actor = mWorld.targetedActor(mousePosition);
-                if (actor != nullptr)
-                {
-                    this->mHoverStatus = FAWorld::HoverStatus(actor->getId());
-                    return;
-                }
-                if (auto item = mWorld.targetedItem(mousePosition))
-                {
-                    this->mHoverStatus = FAWorld::HoverStatus(item->getTile());
-                    return;
-                }
-
+                mLastMousePosition = mousePosition;
+                mLeftMouseDown = mouseDown;
+                return;
+            }
+            case Engine::MouseInputAction::MOUSE_WHEEL:
+            {
+                int32_t scaleChange = mouseWheelDelta.y > 0 ? 1 : (mouseWheelDelta.y < 0 ? -1 : 0);
+                FARender::Renderer::get()->mLevelRenderer->adjustZoom(scaleChange);
                 return;
             }
 
@@ -135,6 +185,35 @@ namespace Engine
             mBlockedFramesLeft--;
             if (mBlockedFramesLeft == 0)
                 mUnblockInput = false;
+        }
+
+        if (mBlockedFramesLeft > 0)
+            return;
+
+        FAWorld::Player* player = mWorld.getCurrentPlayer();
+        if (!player)
+            return;
+
+        if (mLeftMouseDown && !mLastModifiers.shift && !mIsDroppingItem)
+        {
+            Render::Tile clickedTile = FARender::Renderer::get()->getTileByScreenPos(mLastMousePosition.x, mLastMousePosition.y, player->getPos());
+
+            if (player->getLevel()->getTile(clickedTile.pos).passable())
+                mInputs.emplace_back(FAWorld::PlayerInput::DragOverTileData{clickedTile.pos.x, clickedTile.pos.y, false}, player->getId());
+        }
+
+        this->mHoverStatus = FAWorld::HoverStatus();
+
+        auto actor = mWorld.targetedActor(mLastMousePosition);
+        if (actor != nullptr)
+        {
+            this->mHoverStatus = FAWorld::HoverStatus(actor->getId());
+            return;
+        }
+        if (auto item = mWorld.targetedItem(mLastMousePosition))
+        {
+            this->mHoverStatus = FAWorld::HoverStatus(item->getTile());
+            return;
         }
     }
 }

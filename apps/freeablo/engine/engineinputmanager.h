@@ -1,6 +1,4 @@
-
 #pragma once
-
 #include "../components/misc/misc.h"
 #include "../faworld/actoranimationmanager.h"
 #include "inputobserverinterface.h"
@@ -52,17 +50,20 @@ namespace Engine
         void mouseClick(int32_t x, int32_t y, Input::Key key, bool isDoubleClick);
         void mouseRelease(int32_t, int32_t, Input::Key key);
         void mouseMove(int32_t x, int32_t y, int32_t xrel, int32_t yrel);
+        void mouseWheel(int32_t x, int32_t y);
         std::string keyboardActionToString(KeyboardInputAction action) const;
         void notifyKeyboardObservers(KeyboardInputAction action);
-        void notifyMouseObservers(MouseInputAction action, Misc::Point mousePosition, const Input::KeyboardModifiers& modifiers);
+        void notifyMouseObservers(MouseInputAction action, Vec2i mousePosition, Vec2i wheelDelta, bool mouseDown, const Input::KeyboardModifiers& modifiers);
 
         nk_context* mNkCtx = nullptr;
         Input::InputManager mInput;
         Misc::Point mMousePosition;
         bool mMouseDown = false;
         bool mClick = false;
+        bool mRightMouseDown = false;
+        bool mRightClick = false;
         Input::KeyboardModifiers mKbMods;
-        FAGui::GuiManager* mGuiManager;
+        FAGui::GuiManager* mGuiManager = nullptr;
         bool mPaused;
         std::map<KeyboardInputAction, Input::Hotkey> mHotkeys;
         std::vector<KeyboardInputObserverInterface*> mKeyboardObservers;

@@ -4,6 +4,7 @@
 #include "../faworld/playerinput.h"
 #include "inputobserverinterface.h"
 #include "misc/misc.h"
+#include <input/inputmanager.h>
 #include <vector>
 
 namespace FAWorld
@@ -20,7 +21,8 @@ namespace Engine
         virtual ~LocalInputHandler() = default;
 
         virtual void notify(KeyboardInputAction action) override;
-        virtual void notify(MouseInputAction action, Misc::Point mousePosition, bool mouseDown, const Input::KeyboardModifiers& modifiers) override;
+        virtual void
+        notify(MouseInputAction action, Vec2i mousePosition, Vec2i mouseWheelDelta, bool mouseDown, const Input::KeyboardModifiers& modifiers) override;
 
         void addInput(const FAWorld::PlayerInput& input);
         std::vector<FAWorld::PlayerInput> getAndClearInputs();
@@ -37,7 +39,10 @@ namespace Engine
         std::vector<FAWorld::PlayerInput> mInputs;
         int32_t mBlockedFramesLeft = 0;
         bool mUnblockInput = true;
-
         FAWorld::HoverStatus mHoverStatus;
+        Vec2i mLastMousePosition;
+        bool mLeftMouseDown = false;
+        Input::KeyboardModifiers mLastModifiers;
+        bool mIsDroppingItem = false;
     };
 }

@@ -6,11 +6,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <faio/fafileobject.h>
 #include <sstream>
 #include <string>
 #include <vector>
-
-#include <faio/fafileobject.h>
 
 namespace Misc
 {
@@ -69,6 +68,13 @@ namespace Misc
             return inout;
         }
 
+        static std::string toLower(std::string_view in)
+        {
+            std::string retval(in);
+            std::transform(retval.begin(), retval.end(), retval.begin(), (int (*)(int))std::tolower);
+            return retval;
+        }
+
         /// Returns lower case copy of input string
         static std::string lowerCase(const std::string& in)
         {
@@ -107,13 +113,22 @@ namespace Misc
             return retval;
         }
 
-        static std::vector<std::string> split(const std::string& s, char delim)
+        enum class SplitEmptyBehavior
+        {
+            StripEmpties, // "a,,,b,c" => "a" "b" "c"
+            YieldEmpties, // "a,,,b,c" => "a" "" "" "b" "c"
+        };
+
+        static std::vector<std::string> split(const std::string& s, char delim, SplitEmptyBehavior emptyBehavior = SplitEmptyBehavior::YieldEmpties)
         {
             std::vector<std::string> elems;
             std::stringstream ss(s);
             std::string item;
             while (std::getline(ss, item, delim))
             {
+                if (emptyBehavior == SplitEmptyBehavior::StripEmpties && item.empty())
+                    continue;
+
                 elems.push_back(item);
             }
             return elems;
@@ -135,6 +150,16 @@ namespace Misc
             }
         }
 
+        static void rstrip(std::string& s, const std::string chars = " \t\n\v\f\r")
+        {
+            s.erase(std::find_if(s.rbegin(), s.rend(), [chars](int ch) { return chars.find(ch) == std::string::npos; }).base(), s.end());
+        }
+
+        static void lstrip(std::string& s, const std::string chars = " \t\n\v\f\r")
+        {
+            s.erase(s.begin(), std::find_if(s.begin(), s.end(), [chars](int ch) { return chars.find(ch) == std::string::npos; }));
+        }
+
         static std::string readAsString(const std::string& path)
         {
             FAIO::FAFileObject f(path);
@@ -146,6 +171,32 @@ namespace Misc
             f.FAfread(&retval[0], 1, size);
 
             return retval;
+        }
+
+        static std::string getFileExtension(std::string_view path)
+        {
+            size_t i;
+            for (i = path.length() - 1; i > 0; i--)
+            {
+                if (path[i] == '.')
+                    break;
+            }
+
+            std::string extension = std::string(path.substr(i + 1, path.length() - i));
+            std::transform(extension.begin(), extension.end(), extension.begin(), [](char c) { return std::tolower(c); });
+            return extension;
+        }
+
+        static std::string getFileNameNoExtension(std::string_view filename)
+        {
+            size_t i;
+            for (i = filename.length() - 1; i > 0; i--)
+            {
+                if (filename[i] == '.')
+                    break;
+            }
+
+            return std::string(filename.substr(0, i));
         }
     };
 }
